@@ -59,7 +59,7 @@ class FlipperProtocol @Inject constructor() {
     @Volatile
     private var lastRpcActivityAtMs: Long = 0L
 
-    private var currentRequestId: UInt = 0u
+    private var currentRequestId: UInt = 1u
     private val immediateRpcCommandId = AtomicInteger(10_000)
 
     private val _responseFlow = MutableSharedFlow<ProtocolResponse>()
@@ -82,6 +82,7 @@ class FlipperProtocol @Inject constructor() {
     fun onConnectionReset() {
         responseBuffer.reset()
         rawCliCollector = null
+        rawBinaryCollector = null
         firmwareProfile = FirmwareProfile.UNKNOWN
         lastCliProbeAtMs = 0L
         desktopLockProbeSupported = null
@@ -887,6 +888,7 @@ class FlipperProtocol @Inject constructor() {
             "git_commit",
             "branch"
         ) ?: "unknown"
+        updateFirmwareProfileFromVersion(firmwareVersion)
 
         val hardwareVersion = firstNonBlank(
             deviceInfoPairs,
@@ -1297,18 +1299,18 @@ class FlipperProtocol @Inject constructor() {
         private const val RPC_SESSION_START_DELAY_MS = 250L
         private const val RPC_SESSION_STOP_DELAY_MS = 250L
         private const val RPC_SESSION_STOP_GUARD_WINDOW_MS = 5_000L
-        private const val RPC_RETRY_COMMAND_TIMEOUT_MS = 4_000L
-        private const val RPC_COMMAND_TIMEOUT_MS = 1_500L
-        private const val RPC_APP_COMMAND_TIMEOUT_MS = 1_800L
-        private const val RPC_APP_START_TIMEOUT_MS = 1_300L
-        private const val RPC_APP_LOAD_TIMEOUT_MS = 1_900L
-        private const val RPC_APP_BUTTON_TIMEOUT_MS = 1_100L
-        private const val RPC_APP_LOCK_TIMEOUT_MS = 650L
-        private const val RPC_APP_ERROR_TIMEOUT_MS = 650L
-        private const val RPC_APP_FALLBACK_GUI_TIMEOUT_MS = 900L
-        private const val RPC_APP_START_SETTLE_DELAY_MS = 90L
-        private const val RPC_APP_START_ALT_TIMEOUT_MS = 650L
-        private const val RPC_APP_BUTTON_ALT_TIMEOUT_MS = 700L
+        private const val RPC_RETRY_COMMAND_TIMEOUT_MS = 6_000L
+        private const val RPC_COMMAND_TIMEOUT_MS = 2_500L
+        private const val RPC_APP_COMMAND_TIMEOUT_MS = 3_000L
+        private const val RPC_APP_START_TIMEOUT_MS = 3_000L
+        private const val RPC_APP_LOAD_TIMEOUT_MS = 3_500L
+        private const val RPC_APP_BUTTON_TIMEOUT_MS = 2_000L
+        private const val RPC_APP_LOCK_TIMEOUT_MS = 1_500L
+        private const val RPC_APP_ERROR_TIMEOUT_MS = 1_500L
+        private const val RPC_APP_FALLBACK_GUI_TIMEOUT_MS = 2_000L
+        private const val RPC_APP_START_SETTLE_DELAY_MS = 400L
+        private const val RPC_APP_START_ALT_TIMEOUT_MS = 1_500L
+        private const val RPC_APP_BUTTON_ALT_TIMEOUT_MS = 1_500L
         private const val RPC_APP_COMMAND_RETRY_DELAY_MS = 120L
         private const val RPC_APP_COMMAND_MAX_RETRIES = 2
         private const val RPC_APP_FAST_REPEAT_WINDOW_MS = 15_000L
@@ -1671,6 +1673,11 @@ class FlipperProtocol @Inject constructor() {
                 markCliUnavailable("Flipper command transport is not connected")
                 return@withCommandLock false
             }
+            // Momentum Firmware auto-starts RPC on BLE connect; sending raw CLI text over
+            // BLE causes a protobuf decode error which immediately disconnects BLE.
+            if (service.isBluetoothTransport()) {
+                return@withCommandLock false
+            }
             val data = "$text\r\n".toByteArray(Charsets.UTF_8)
             val sent = service.sendData(data)
             if (!sent) {
@@ -1710,11 +1717,50 @@ class FlipperProtocol @Inject constructor() {
             return@withCommandLock current
         }
 
+        // Momentum Firmware (and all Flipper BLE) auto-starts RPC on connect.
+        // Sending CLI probe text over BLE causes a protobuf decode error → BLE disconnect.
+        // For BLE transport, go straight to RPC ping and mark as RPC-only.
+        if (service.isBluetoothTransport()) {
+            val rpcStatus = probeRpcTransportAvailability(
+                detail = "RPC session auto-started by Momentum Firmware on BLE connect"
+            )
+            return@withCommandLock rpcStatus ?: markCliUnavailable(
+                "BLE RPC session not yet ready. Reconnect the Flipper and try again."
+            )
+        }
+
+        // If RPC is already confirmed active (e.g. after USB start_rpc_session prime),
+        // skip CLI probe text — it would be decoded as malformed protobuf and crash the
+        // RPC session. Instead, confirm the existing RPC session is still alive.
+        if (_cliStatus.value.supportsRpc) {
+            val rpcStatus = probeRpcTransportAvailability(
+                detail = "RPC session confirmed active; skipping CLI probe to protect session"
+            )
+            return@withCommandLock rpcStatus ?: run {
+                // RPC was active but ping timed out; clear the stale status and fall through
+                // to normal probing so we can detect what changed.
+                markCliUnavailable("RPC was previously active but no longer responds. Try reconnecting.")
+            }
+        }
+
         val response = probeRawCliOutput()
 
         return@withCommandLock if (response.isNotBlank()) {
             markCliReady(response)
         } else {
+            val rerouted = tryAlternateBleSerialRoute()
+            if (rerouted) {
+                val reroutedCliResponse = probeRawCliOutput()
+                if (reroutedCliResponse.isNotBlank()) {
+                    return@withCommandLock markCliReady(reroutedCliResponse)
+                }
+                val reroutedRpc = probeRpcTransportAvailability(
+                    detail = "RPC ping responded after switching BLE write characteristic"
+                )
+                if (reroutedRpc != null) {
+                    return@withCommandLock recoverCliFromRpcSessionLocked()
+                }
+            }
             val rpcStatus = probeRpcTransportAvailability()
             if (rpcStatus != null) {
                 recoverCliFromRpcSessionLocked()
@@ -1839,6 +1885,9 @@ class FlipperProtocol @Inject constructor() {
     }
 
     private suspend fun probeRawCliOutput(): String {
+        // Sending raw CLI text over BLE causes a protobuf decode error on Momentum Firmware,
+        // which immediately disconnects BLE. BLE transport uses RPC-only mode.
+        if (bleService?.isBluetoothTransport() == true) return ""
         for (probe in CLI_PROBE_COMMANDS) {
             val output = collectRawCliResponse(probe, RAW_CLI_PROBE_TIMEOUT_MS).trim()
             if (output.isNotBlank() && isLikelyCliText(output)) {
@@ -1846,6 +1895,11 @@ class FlipperProtocol @Inject constructor() {
             }
         }
         return ""
+    }
+
+    private suspend fun tryAlternateBleSerialRoute(): Boolean {
+        val service = bleService ?: return false
+        return service.tryAlternateBleSerialRoute()
     }
 
     suspend fun executeRpcAppCommand(command: String): ProtocolResponse = withCommandLock(
@@ -1882,6 +1936,15 @@ class FlipperProtocol @Inject constructor() {
             ?: return@withCommandLock ProtocolResponse.Error(
                 "No RPC action mapping for command: $command"
             )
+
+        // CLI-passthrough plan: this command is best executed via raw CLI, not app launch.
+        // Signal the caller to try CLI instead of failing with "no mapping".
+        if (plan.skipAppLaunch) {
+            return@withCommandLock ProtocolResponse.Error(
+                "CLI_PASSTHROUGH: $command requires CLI execution"
+            )
+        }
+
         val appStartCacheKey = buildRpcAppStartCacheKey(plan.appCandidates)
         val buttonCacheKey = buildRpcButtonCacheKey(plan)
         val executionKey = buildRpcExecutionCacheKey(plan, appStartCacheKey)
@@ -2173,6 +2236,10 @@ class FlipperProtocol @Inject constructor() {
         }
         val nowMs = System.currentTimeMillis()
         val fastPathReady = isRemoteFastPathReady(nowMs)
+        val writeRouteVerified = service.isBleWriteRouteVerified()
+        if (!writeRouteVerified) {
+            return sendGuiInputEvent(key, inputType)
+        }
         if (!fastPathReady) {
             val bootstrapResponse = withTimeoutOrNull(RPC_REMOTE_BOOTSTRAP_LOCK_TIMEOUT_MS) {
                 commandMutex.withLock {
@@ -2608,6 +2675,51 @@ class FlipperProtocol @Inject constructor() {
         return response.commandStatus
     }
 
+    /**
+     * Send a hardware input event via the RPC GUI service (Momentum / any firmware).
+     * Works on BLE RPC-only connections — does NOT require CLI availability.
+     * Used by INPUT_SEND action to simulate button presses on the Flipper screen.
+     */
+    suspend fun sendRpcInputEvent(key: String, pressType: String): ProtocolResponse {
+        return withCommandLock(
+            operation = "sendRpcInputEvent",
+            onTimeout = { ProtocolResponse.Error("Command pipeline busy while sending input event: $key $pressType") }
+        ) {
+            val inputKey = when (key.lowercase().trim()) {
+                "up"     -> com.flipperdevices.protobuf.screen.Gui.InputKey.UP
+                "down"   -> com.flipperdevices.protobuf.screen.Gui.InputKey.DOWN
+                "right"  -> com.flipperdevices.protobuf.screen.Gui.InputKey.RIGHT
+                "left"   -> com.flipperdevices.protobuf.screen.Gui.InputKey.LEFT
+                "ok"     -> com.flipperdevices.protobuf.screen.Gui.InputKey.OK
+                "back"   -> com.flipperdevices.protobuf.screen.Gui.InputKey.BACK
+                else     -> return@withCommandLock ProtocolResponse.Error("Unknown key: $key")
+            }
+            val inputType = when (pressType.lowercase().trim()) {
+                "press"   -> com.flipperdevices.protobuf.screen.Gui.InputType.PRESS
+                "release" -> com.flipperdevices.protobuf.screen.Gui.InputType.RELEASE
+                "short"   -> com.flipperdevices.protobuf.screen.Gui.InputType.SHORT
+                "long"    -> com.flipperdevices.protobuf.screen.Gui.InputType.LONG
+                "repeat"  -> com.flipperdevices.protobuf.screen.Gui.InputType.REPEAT
+                else      -> com.flipperdevices.protobuf.screen.Gui.InputType.SHORT
+            }
+            val response = sendRpcMainAndAwaitResponse(timeoutMs = RPC_COMMAND_TIMEOUT_MS) {
+                setGuiSendInputEventRequest(
+                    com.flipperdevices.protobuf.screen.Gui.SendInputEventRequest.newBuilder()
+                        .setKey(inputKey)
+                        .setType(inputType)
+                        .build()
+                )
+            }
+            if (response == null) {
+                ProtocolResponse.Error("No response from Flipper for input event")
+            } else if (response.commandStatus == com.flipperdevices.protobuf.Flipper.CommandStatus.OK) {
+                ProtocolResponse.Success("Input event sent: $key $pressType")
+            } else {
+                ProtocolResponse.Error("Input event failed: ${response.commandStatus}")
+            }
+        }
+    }
+
     private suspend fun requestAppLockStatusLocked(
         timeoutMs: Long = RPC_APP_LOCK_TIMEOUT_MS
     ): Boolean? {
@@ -2950,6 +3062,118 @@ class FlipperProtocol @Inject constructor() {
             )
         }
 
+        // ── Momentum: subghz rx / rx_raw / chat → open Sub-GHz app interactively ───
+        val subGhzRxMatch = Regex(
+            "^subghz\\s+(?:rx|rx_raw|chat)(?:\\s+(\\d+))?$",
+            RegexOption.IGNORE_CASE
+        ).find(normalized)
+        if (subGhzRxMatch != null) {
+            return RpcCommandPlan(
+                appCandidates = buildRpcAppCandidates(
+                    baseCandidates = listOf("Sub-GHz", "SubGhz", "Sub GHz", "SubGHz"),
+                    customOverride = null
+                ),
+                appArgs = "",
+                buttonArgsCandidates = listOf(""),
+                triggerOkPress = false
+            )
+        }
+
+        // ── Momentum: ir rx / ir universal → open Infrared app interactively ────
+        val irRxMatch = Regex(
+            "^(?:ir|infrared)\\s+(?:rx|rx\\s+raw|universal)(?:\\s+(.+))?$",
+            RegexOption.IGNORE_CASE
+        ).find(normalized)
+        if (irRxMatch != null) {
+            return RpcCommandPlan(
+                appCandidates = buildRpcAppCandidates(
+                    baseCandidates = listOf("Infrared", "Infrared Remote", "IR Remote", "IR"),
+                    customOverride = null
+                ),
+                appArgs = "",
+                buttonArgsCandidates = listOf(""),
+                triggerOkPress = false
+            )
+        }
+
+        // ── Momentum: nfc scanner / nfc field / nfc dump → open NFC app ─────────
+        val nfcInteractiveMatch = Regex(
+            "^nfc\\s+(?:scanner|field|dump)(?:\\s+.*)?$",
+            RegexOption.IGNORE_CASE
+        ).find(normalized)
+        if (nfcInteractiveMatch != null) {
+            val nfcDumpPath = Regex(
+                "^nfc\\s+dump\\s+(.+)$",
+                RegexOption.IGNORE_CASE
+            ).find(normalized)?.groupValues?.getOrNull(1)?.trim()
+            return RpcCommandPlan(
+                appCandidates = buildRpcAppCandidates(
+                    baseCandidates = listOf("NFC", "Nfc", "NFC App"),
+                    customOverride = null
+                ),
+                appArgs = "",
+                filePath = nfcDumpPath?.takeIf { it.isNotBlank() },
+                buttonArgsCandidates = listOf(""),
+                triggerOkPress = false
+            )
+        }
+
+        // ── Momentum: js <path> → JavaScript Runner app ───────────────────────
+        val jsTail = Regex(
+            "^js\\s+(.+)$",
+            RegexOption.IGNORE_CASE
+        ).find(normalized)?.groupValues?.getOrNull(1)?.trim()
+        if (!jsTail.isNullOrBlank()) {
+            return RpcCommandPlan(
+                appCandidates = buildRpcAppCandidates(
+                    baseCandidates = listOf(
+                        "JavaScript Runner",
+                        "JS Runner",
+                        "JavaScript",
+                        "JS App",
+                        "js_app"
+                    ),
+                    customOverride = null
+                ),
+                appArgs = "",
+                filePath = jsTail,
+                buttonArgsCandidates = listOf(""),
+                triggerOkPress = false
+            )
+        }
+
+        // ── Momentum CLI-only commands: skipAppLaunch so caller tries raw CLI ───
+        // These commands don't map to app launches but need a plan so they're
+        // not rejected by the "no RPC mapping" guard in executeCli().
+        val cliOnlyPattern = Regex(
+            "^(?:" +
+                "buzzer\\s+(?:note|freq)\\s+.+" +
+                "|loader\\s+(?:list|close|info|signal.*)" +
+                "|power\\s+(?:off|reboot|reboot2dfu|5v|3v3).*" +
+                "|gpio\\s+(?:set|get|mode)\\s+.*" +
+                "|i2c\\s+(?:scan|read|write).*" +
+                "|rfid\\s+(?:read|write|raw_read|raw_emulate|raw_analyze).*" +
+                "|ikey\\s+(?:read|write).*" +
+                "|onewire\\s+.*" +
+                "|dolphin\\s+.*" +
+                "|input\\s+(?:dump|keyboard).*" +
+                "|top|free|uptime|date|neofetch|src" +
+                "|bt\\s+(?:hci_info|carrier_tx|carrier_rx|packet_tx|packet_rx).*" +
+                "|subghz\\s+decode_raw\\s+.*" +
+                "|nfc\\s+(?:apdu|raw|mfu)\\s+.*" +
+            ")$",
+            RegexOption.IGNORE_CASE
+        )
+        if (cliOnlyPattern.matches(normalized)) {
+            return RpcCommandPlan(
+                appCandidates = emptyList(),
+                appArgs = "",
+                buttonArgsCandidates = listOf(""),
+                triggerOkPress = false,
+                skipAppLaunch = true
+            )
+        }
+
         // Generic app launcher: "loader open <AppName> [args]"
         val loaderTail = Regex(
             "^loader\\s+open\\s+(.+)$",
@@ -2969,7 +3193,10 @@ class FlipperProtocol @Inject constructor() {
                     baseCandidates = listOf(appName),
                     customOverride = null
                 ),
-                appArgs = remainingArgs.ifBlank { RPC_APP_START_ARGUMENT },
+                // Empty args → app opens in normal interactive mode (not RPC-remote mode).
+                // "loader open NFC" should show the NFC menu on screen for the user to interact
+                // with, not lock the app into a headless RPC-waiting state.
+                appArgs = remainingArgs,
                 buttonArgsCandidates = listOf(""),
                 triggerOkPress = false
             )
@@ -3102,6 +3329,13 @@ class FlipperProtocol @Inject constructor() {
                 markCliUnavailable("Flipper command transport is not connected")
             }
         }
+        // Momentum Firmware auto-starts RPC on BLE connect; raw CLI text over BLE causes
+        // a protobuf decode error which immediately disconnects BLE.
+        if (service.isBluetoothTransport()) {
+            return@withCommandLock ProtocolResponse.Error(
+                "Raw CLI commands are not supported over BLE. Use RPC commands instead."
+            )
+        }
 
         val responseText = collectRawCliResponse("$command\r\n", RAW_CLI_TIMEOUT_MS)
         if (responseText.isNotBlank() && isLikelyCliText(responseText)) {
@@ -3112,6 +3346,17 @@ class FlipperProtocol @Inject constructor() {
         // Validate that the CLI transport is alive before claiming command success.
         val probeResponse = collectRawCliResponse("version\r\n", RAW_CLI_PROBE_TIMEOUT_MS).trim()
         if (probeResponse.isBlank() || !isLikelyCliText(probeResponse)) {
+            if (tryAlternateBleSerialRoute()) {
+                val reroutedProbe = collectRawCliResponse("version\r\n", RAW_CLI_PROBE_TIMEOUT_MS).trim()
+                if (reroutedProbe.isNotBlank() && isLikelyCliText(reroutedProbe)) {
+                    markCliReady(reroutedProbe)
+                    val retriedResponse = collectRawCliResponse("$command\r\n", RAW_CLI_TIMEOUT_MS)
+                    if (retriedResponse.isNotBlank() && isLikelyCliText(retriedResponse)) {
+                        markCliReady(retriedResponse)
+                        return@withCommandLock ProtocolResponse.FileContent(retriedResponse.trim())
+                    }
+                }
+            }
             val rpcStatus = probeRpcTransportAvailability()
             if (rpcStatus != null) {
                 val recovered = recoverCliFromRpcSessionLocked()
@@ -3242,7 +3487,7 @@ class FlipperProtocol @Inject constructor() {
     private suspend fun probeRpcTransportAvailability(
         detail: String = "RPC ping responded (CLI unavailable on this transport)"
     ): CliCapabilityStatus? {
-        var response = sendRpcMainAndAwaitResponse(
+        suspend fun sendPing(): Flipper.Main? = sendRpcMainAndAwaitResponse(
             timeoutMs = RPC_COMMAND_TIMEOUT_MS
         ) {
             setSystemPingRequest(
@@ -3251,16 +3496,16 @@ class FlipperProtocol @Inject constructor() {
                     .build()
             )
         }
+        var response = sendPing()
         if (response == null && tryStartRpcSession()) {
             delay(RPC_SESSION_START_DELAY_MS)
-            response = sendRpcMainAndAwaitResponse(
-                timeoutMs = RPC_COMMAND_TIMEOUT_MS
-            ) {
-                setSystemPingRequest(
-                    PBSystem.PingRequest.newBuilder()
-                        .setData(ByteString.copyFromUtf8("vesper-ping"))
-                        .build()
-                )
+            response = sendPing()
+        }
+        if (response == null && tryAlternateBleSerialRoute()) {
+            response = sendPing()
+            if (response == null && tryStartRpcSession()) {
+                delay(RPC_SESSION_START_DELAY_MS)
+                response = sendPing()
             }
         }
         if (response == null) return null
@@ -3342,9 +3587,16 @@ class FlipperProtocol @Inject constructor() {
 
     private suspend fun tryStartRpcSession(): Boolean {
         val service = bleService ?: return false
+        // Momentum Firmware auto-starts RPC on BLE connect (bt_open_rpc_connection is called
+        // on GapEventTypeConnected). Sending "start_rpc_session" text over BLE causes a
+        // protobuf decode error which disconnects BLE immediately.
+        if (service.isBluetoothTransport()) {
+            lastRpcActivityAtMs = System.currentTimeMillis()
+            return true
+        }
         val sessionCommands = listOf(
-            "start_rpc_session\r",
             "start_rpc_session\r\n",
+            "start_rpc_session\r",
             "start_rpc_session\n"
         )
         sessionCommands.forEach { command ->
@@ -3366,6 +3618,12 @@ class FlipperProtocol @Inject constructor() {
         }
 
         val service = bleService ?: return false
+        // Momentum Firmware auto-starts RPC on BLE connect and does not support stopping it
+        // via CLI text. Sending "stop_rpc_session" text over BLE causes a protobuf decode
+        // error which disconnects BLE. The RPC framed stop above is the only safe path.
+        if (service.isBluetoothTransport()) {
+            return false
+        }
         val stopCommands = listOf(
             "stop_rpc_session\r",
             "stop_rpc_session\r\n",
@@ -3506,7 +3764,7 @@ class FlipperProtocol @Inject constructor() {
             checkedAtMs = System.currentTimeMillis(),
             supportsCli = previous.supportsCli,
             supportsRpc = true,
-            firmwareHint = null,
+            firmwareHint = previous.firmwareHint,
             details = detail
         )
         _cliStatus.value = status
@@ -3602,6 +3860,26 @@ class FlipperProtocol @Inject constructor() {
             is ProtocolResponse.FileContent -> response.content
             is ProtocolResponse.BinaryContent -> response.data.toString(Charsets.UTF_8)
             else -> ""
+        }
+    }
+
+    private fun updateFirmwareProfileFromVersion(version: String) {
+        if (firmwareProfile != FirmwareProfile.UNKNOWN) return
+        val lower = version.lowercase()
+        firmwareProfile = when {
+            lower.contains("momentum") || lower.contains("mntm") -> FirmwareProfile.MOMENTUM
+            lower.contains("unleashed") -> FirmwareProfile.UNLEASHED
+            lower.contains("roguemaster") || lower.contains("rogue master") -> FirmwareProfile.ROGUEMASTER
+            lower.contains("xtreme") -> FirmwareProfile.XTREME
+            else -> firmwareProfile
+        }
+        if (firmwareProfile != FirmwareProfile.UNKNOWN) {
+            // Also set firmwareHint on the CLI status so resolveFirmwareFamily has fallback
+            val prev = _cliStatus.value
+            if (prev.firmwareHint == null) {
+                _cliStatus.value = prev.copy(firmwareHint = version.trim().take(80))
+            }
+            refreshFirmwareCompatibility()
         }
     }
 
@@ -3760,7 +4038,15 @@ class FlipperProtocol @Inject constructor() {
         val appArgs: String = "",
         val filePath: String? = null,
         val buttonArgsCandidates: List<String> = listOf("OK", "ok", ""),
-        val triggerOkPress: Boolean = true
+        val triggerOkPress: Boolean = true,
+        /**
+         * When true, skip the RPC app-launch step and let the caller
+         * fall through to raw CLI. Used for Momentum CLI-only commands
+         * (buzzer, loader list, etc.) that have no app-launch equivalent
+         * but still need a "has mapping" signal to bypass the
+         * "no RPC mapping" early return.
+         */
+        val skipAppLaunch: Boolean = false
     )
 
     private data class RpcExecutionSnapshot(

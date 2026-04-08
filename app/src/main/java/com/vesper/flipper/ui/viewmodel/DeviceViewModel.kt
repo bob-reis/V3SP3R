@@ -12,6 +12,7 @@ import com.vesper.flipper.ble.ConnectionState
 import com.vesper.flipper.ble.FirmwareCompatibilityProfile
 import com.vesper.flipper.ble.FlipperDevice
 import com.vesper.flipper.ble.FlipperFileSystem
+import com.vesper.flipper.ble.TransportTelemetry
 import com.vesper.flipper.data.SettingsStore
 import com.vesper.flipper.domain.model.DeviceInfo
 import com.vesper.flipper.domain.model.FlipperRemoteButton
@@ -54,6 +55,8 @@ class DeviceViewModel @Inject constructor(
     val storageInfo: StateFlow<StorageInfo?> = _storageInfo.asStateFlow()
     private val _cliCapabilityStatus = MutableStateFlow(CliCapabilityStatus())
     val cliCapabilityStatus: StateFlow<CliCapabilityStatus> = _cliCapabilityStatus.asStateFlow()
+    private val _transportTelemetry = MutableStateFlow(TransportTelemetry.idle())
+    val transportTelemetry: StateFlow<TransportTelemetry> = _transportTelemetry.asStateFlow()
 
     private val _isRefreshing = MutableStateFlow(false)
     val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
@@ -106,7 +109,12 @@ class DeviceViewModel @Inject constructor(
             bleServiceManager.connectionState.collect { state ->
                 _connectionState.value = state
                 if (state is ConnectionState.Connected) {
-                    refreshDeviceInfo()
+                    // Defer device info refresh so the command pipeline is free for user
+                    // interactions (arrow keys, CLI commands) immediately after connect.
+                    viewModelScope.launch {
+                        kotlinx.coroutines.delay(REFRESH_ON_CONNECT_DELAY_MS)
+                        refreshDeviceInfo()
+                    }
                 } else {
                     clearConnectionTransientState()
                 }
@@ -135,6 +143,11 @@ class DeviceViewModel @Inject constructor(
                 _cliCapabilityStatus.value = status
             }
         }
+        viewModelScope.launch {
+            bleServiceManager.transportTelemetry.collect { telemetry ->
+                _transportTelemetry.value = telemetry
+            }
+        }
     }
 
     private fun clearConnectionTransientState() {
@@ -142,6 +155,7 @@ class DeviceViewModel @Inject constructor(
         _isSendingRemoteInput.value = false
         _remoteInputStatus.value = null
         _connectionDiagnostics.value = ConnectionDiagnosticsReport.idle()
+        _transportTelemetry.value = TransportTelemetry.idle()
     }
 
     fun startScan() {
@@ -169,6 +183,7 @@ class DeviceViewModel @Inject constructor(
         _isRunningDiagnostics.value = false
         _isSendingRemoteInput.value = false
         _remoteInputStatus.value = null
+        _transportTelemetry.value = TransportTelemetry.idle()
     }
 
     fun refreshDeviceInfo() {
@@ -200,6 +215,8 @@ class DeviceViewModel @Inject constructor(
     companion object {
         /** Total wall-clock budget for the on-connect device info refresh. */
         private const val REFRESH_DEVICE_INFO_TIMEOUT_MS = 6_000L
+        /** Delay after connect before auto-refreshing device info, so user commands go first. */
+        private const val REFRESH_ON_CONNECT_DELAY_MS = 3_000L
     }
 
     fun runConnectionDiagnostics() {

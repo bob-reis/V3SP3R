@@ -334,6 +334,239 @@ class RiskAssessor @Inject constructor(
                 )
             }
 
+            // ── Momentum Firmware exclusive actions ──────────────
+
+            // LOW risk: send button press — non-destructive UI navigation
+            CommandAction.INPUT_SEND -> {
+                RiskAssessment(
+                    level = RiskLevel.LOW,
+                    reason = "Hardware button input simulation",
+                    affectedPaths = paths,
+                    requiresDiff = false,
+                    requiresConfirmation = false
+                )
+            }
+
+            // HIGH risk: power off / reboot — interrupts device operation
+            CommandAction.POWER_CONTROL -> {
+                val op = (command.args.operation ?: command.args.command ?: "").lowercase()
+                val isDfu = op.contains("dfu") || op.contains("recovery")
+                RiskAssessment(
+                    level = RiskLevel.HIGH,
+                    reason = if (isDfu) "Reboot into DFU/recovery mode" else "Power off or reboot device",
+                    affectedPaths = paths,
+                    requiresDiff = false,
+                    requiresConfirmation = true
+                )
+            }
+
+            // LOW risk: loader list is read-only
+            CommandAction.LOADER_LIST -> {
+                RiskAssessment(
+                    level = RiskLevel.LOW,
+                    reason = "Read-only app list query",
+                    affectedPaths = paths,
+                    requiresDiff = false,
+                    requiresConfirmation = false
+                )
+            }
+
+            // MEDIUM risk: loader close interrupts running app
+            CommandAction.LOADER_CLOSE -> {
+                RiskAssessment(
+                    level = RiskLevel.MEDIUM,
+                    reason = "Close foreground app on Flipper",
+                    affectedPaths = paths,
+                    requiresDiff = false,
+                    requiresConfirmation = true
+                )
+            }
+
+            // LOW risk: buzzer is harmless audio output
+            CommandAction.BUZZER -> {
+                RiskAssessment(
+                    level = RiskLevel.LOW,
+                    reason = "Buzzer audio output",
+                    affectedPaths = paths,
+                    requiresDiff = false,
+                    requiresConfirmation = false
+                )
+            }
+
+            // LOW risk: listing asset packs is read-only
+            CommandAction.ASSET_PACK_LIST -> {
+                RiskAssessment(
+                    level = RiskLevel.LOW,
+                    reason = "Read-only asset pack query",
+                    affectedPaths = paths,
+                    requiresDiff = false,
+                    requiresConfirmation = false
+                )
+            }
+
+            // MEDIUM risk: changing asset pack modifies a settings file
+            CommandAction.ASSET_PACK_SET -> {
+                RiskAssessment(
+                    level = RiskLevel.MEDIUM,
+                    reason = "Change active Momentum asset pack",
+                    affectedPaths = paths,
+                    requiresDiff = false,
+                    requiresConfirmation = true
+                )
+            }
+
+            // ── Batch A: Sub-GHz extended ────────────────────────
+
+            // MEDIUM: receive opens radio — non-destructive
+            CommandAction.SUBGHZ_RECEIVE -> RiskAssessment(
+                level = RiskLevel.MEDIUM,
+                reason = "Sub-GHz signal reception",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = true
+            )
+            // LOW: decoding a file is read-only
+            CommandAction.SUBGHZ_DECODE -> RiskAssessment(
+                level = RiskLevel.LOW,
+                reason = "Decode Sub-GHz .sub file (read-only)",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = false
+            )
+            // MEDIUM: opens radio channel for chat
+            CommandAction.SUBGHZ_CHAT -> RiskAssessment(
+                level = RiskLevel.MEDIUM,
+                reason = "Sub-GHz P2P chat (RF transmission)",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = true
+            )
+
+            // ── Batch B: Infrared extended ───────────────────────
+
+            // LOW: receive is passive
+            CommandAction.IR_RECEIVE -> RiskAssessment(
+                level = RiskLevel.LOW,
+                reason = "Passive IR signal reception",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = false
+            )
+            // MEDIUM: transmits IR signals (brute-force)
+            CommandAction.IR_UNIVERSAL -> RiskAssessment(
+                level = RiskLevel.MEDIUM,
+                reason = "IR universal remote brute-force transmission",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = true
+            )
+
+            // ── Batch C: NFC suite ───────────────────────────────
+
+            // LOW: toggling field is harmless
+            CommandAction.NFC_FIELD -> RiskAssessment(
+                level = RiskLevel.LOW,
+                reason = "NFC field toggle (hardware state only)",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = false
+            )
+            // MEDIUM: sends data to a card
+            CommandAction.NFC_APDU -> RiskAssessment(
+                level = RiskLevel.MEDIUM,
+                reason = "Send APDU command to NFC tag",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = true
+            )
+            // MEDIUM: writes a dump file
+            CommandAction.NFC_DUMP -> RiskAssessment(
+                level = RiskLevel.MEDIUM,
+                reason = "Dump NFC tag to file",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = true
+            )
+            // LOW: passive scanner
+            CommandAction.NFC_SCANNER -> RiskAssessment(
+                level = RiskLevel.LOW,
+                reason = "Passive NFC tag scanner",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = false
+            )
+
+            // ── Batch D: GPIO / I2C / Power extended ─────────────
+
+            // MEDIUM: GPIO changes hardware pins — can affect connected circuits
+            CommandAction.GPIO_CONTROL -> {
+                val op = (command.args.operation ?: command.args.command ?: "get").lowercase()
+                if (op == "get") {
+                    RiskAssessment(
+                        level = RiskLevel.LOW,
+                        reason = "Read GPIO pin state",
+                        affectedPaths = paths, requiresDiff = false, requiresConfirmation = false
+                    )
+                } else {
+                    RiskAssessment(
+                        level = RiskLevel.MEDIUM,
+                        reason = "GPIO pin control (may affect connected hardware)",
+                        affectedPaths = paths, requiresDiff = false, requiresConfirmation = true
+                    )
+                }
+            }
+            // MEDIUM: I2C can affect connected sensors/devices
+            CommandAction.I2C_CONTROL -> {
+                val op = (command.args.operation ?: command.args.command ?: "scan").lowercase()
+                if (op == "scan") {
+                    RiskAssessment(
+                        level = RiskLevel.LOW,
+                        reason = "I2C bus scan (read-only)",
+                        affectedPaths = paths, requiresDiff = false, requiresConfirmation = false
+                    )
+                } else {
+                    RiskAssessment(
+                        level = RiskLevel.MEDIUM,
+                        reason = "I2C read/write (affects connected devices)",
+                        affectedPaths = paths, requiresDiff = false, requiresConfirmation = true
+                    )
+                }
+            }
+            // HIGH: toggling power rails can damage connected hardware
+            CommandAction.POWER_RAIL -> RiskAssessment(
+                level = RiskLevel.HIGH,
+                reason = "External power rail control (5V/3.3V) — can damage hardware",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = true
+            )
+
+            // ── Batch E: JavaScript engine ────────────────────────
+
+            // MEDIUM: JS can access GPIO, Sub-GHz, storage, etc.
+            CommandAction.JS_RUN -> RiskAssessment(
+                level = RiskLevel.MEDIUM,
+                reason = "Execute JavaScript (can access hardware and storage)",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = true
+            )
+
+            // ── Batch F: Momentum settings / display ─────────────
+
+            // MEDIUM: modifies backlight settings file
+            CommandAction.RGB_BACKLIGHT -> RiskAssessment(
+                level = RiskLevel.MEDIUM,
+                reason = "Change RGB backlight setting",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = true
+            )
+            // MEDIUM: modifies Momentum settings file
+            CommandAction.MOMENTUM_SETTING -> {
+                if (command.args.settingValue == null) {
+                    RiskAssessment(
+                        level = RiskLevel.LOW,
+                        reason = "Read Momentum setting (read-only)",
+                        affectedPaths = paths, requiresDiff = false, requiresConfirmation = false
+                    )
+                } else {
+                    RiskAssessment(
+                        level = RiskLevel.MEDIUM,
+                        reason = "Modify Momentum firmware setting",
+                        affectedPaths = paths, requiresDiff = false, requiresConfirmation = true
+                    )
+                }
+            }
+            // MEDIUM: writes device name file
+            CommandAction.DEVICE_SPOOF -> RiskAssessment(
+                level = RiskLevel.MEDIUM,
+                reason = "Change Flipper display name",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = true
+            )
+            // MEDIUM: sends signal to running app
+            CommandAction.LOADER_SIGNAL -> RiskAssessment(
+                level = RiskLevel.MEDIUM,
+                reason = "Send signal to foreground app",
+                affectedPaths = paths, requiresDiff = false, requiresConfirmation = true
+            )
+
             CommandAction.EXECUTE_CLI -> {
                 val cliCommand = (command.args.command ?: command.args.content).orEmpty()
                 when {
@@ -441,7 +674,47 @@ class RiskAssessor @Inject constructor(
             "storage stat",
             // Harmless hardware feedback
             "led ",
-            "vibro "
+            "vibro ",
+            // Momentum: read-only loader query
+            "loader list",
+            "loader info",
+            // Momentum: input simulation (non-destructive UI navigation)
+            "input send",
+            "input dump",
+            // Momentum: buzzer / music output
+            "music_player play_note",
+            "music_player stop",
+            // Momentum: read-only dolphin/Momentum status
+            "momentum info",
+            "momentum status",
+            "dolphin stats",
+            "dolphin level",
+            // Momentum: JS read/list
+            "js list",
+            "js --list",
+            // Sub-GHz read-only
+            "subghz decode_raw",
+            // Infrared read-only
+            "ir rx",
+            // NFC passive operations
+            "nfc scanner",
+            "nfc field",
+            // GPIO read
+            "gpio get",
+            // I2C scan
+            "i2c scan",
+            // System info
+            "top",
+            "free",
+            "uptime",
+            "date",
+            "info",
+            "neofetch",
+            "src",
+            // Bluetooth info
+            "bt hci_info",
+            // OneWire scan
+            "onewire scan"
         )
 
         /**
@@ -450,14 +723,21 @@ class RiskAssessor @Inject constructor(
          */
         private val MEDIUM_CLI_PREFIXES = listOf(
             "loader open",
-            "loader list",
-            "loader info",
+            "loader close",
+            "loader signal",
             "subghz tx",
             "subghz tx_from_file",
+            "subghz rx",
+            "subghz chat",
+            "subghz read_raw",
             "ir tx",
             "infrared tx",
             "nfc emulate",
             "nfc emu",
+            "nfc apdu",
+            "nfc raw",
+            "nfc field",
+            "nfc scanner",
             "rfid emulate",
             "rfid emu",
             "lfrfid emulate",
@@ -470,9 +750,57 @@ class RiskAssessor @Inject constructor(
             "ble_scan",
             "blescan",
             "ble scan",
+            // Momentum: music playback
+            "music_player play",
+            // Momentum: JavaScript execution (sandboxed, medium risk)
+            "js ",
+            // Momentum: dolphin XP manipulation (non-destructive)
+            "dolphin xp",
+            "dolphin flush",
+            // Momentum: momentum settings changes (medium risk — affects device UI)
+            "momentum settings",
+            "momentum set",
+            // Sub-GHz medium
+            "subghz rx",
+            "subghz chat",
+            "subghz tx_from_file",
+            "subghz tx ",
+            // Infrared medium
+            "ir tx",
+            "ir universal",
+            // NFC medium
+            "nfc apdu",
+            "nfc raw",
+            "nfc dump",
+            "nfc emulate",
+            "nfc mfu",
+            // RFID
+            "rfid read",
+            "rfid emulate",
+            "rfid write",
+            // iButton
+            "ikey read",
+            "ikey emulate",
+            "ikey write",
+            // OneWire
+            "onewire read",
+            // GPIO write/mode
+            "gpio set",
+            "gpio mode",
+            // I2C
+            "i2c read",
+            "i2c write",
+            // BT testing
+            "bt carrier_tx",
+            "bt carrier_rx",
+            "bt packet_tx",
+            "bt packet_rx",
+            // Loader
+            "loader open",
+            "loader close",
+            "loader signal",
+            // Note: power off/reboot/5v/3v3 are HIGH risk via else branch.
             // Note: badusb is HIGH risk via dedicated BADUSB_EXECUTE action.
-            // But if someone uses raw CLI, we still want user confirmation (HIGH via else branch).
-            // So badusb is intentionally NOT in the MEDIUM list.
         )
     }
 }

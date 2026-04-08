@@ -1,6 +1,7 @@
 package com.vesper.flipper.domain.executor
 
 import com.vesper.flipper.ble.FlipperFileSystem
+import com.vesper.flipper.ble.ProtocolResponse
 import com.vesper.flipper.data.SettingsStore
 import com.vesper.flipper.domain.model.*
 import com.vesper.flipper.domain.service.AuditService
@@ -657,6 +658,420 @@ class CommandExecutor @Inject constructor(
                 CommandResultData(
                     content = "request_photo is handled at the agent layer",
                     message = "Photo capture handled by agent"
+                )
+            }
+
+            // ── Momentum Firmware exclusive actions ─────────────
+
+            CommandAction.INPUT_SEND -> {
+                val key = command.args.key
+                    ?: throw IllegalArgumentException(
+                        "key required (up/down/left/right/ok/back)"
+                    )
+                val pressType = command.args.pressType ?: "short"
+                val validKeys = setOf("up", "down", "left", "right", "ok", "back")
+                val validTypes = setOf("press", "release", "short", "long", "repeat")
+                if (key.lowercase() !in validKeys) {
+                    throw IllegalArgumentException(
+                        "Invalid key '$key'. Valid: ${validKeys.joinToString()}"
+                    )
+                }
+                if (pressType.lowercase() !in validTypes) {
+                    throw IllegalArgumentException(
+                        "Invalid press_type '$pressType'. Valid: ${validTypes.joinToString()}"
+                    )
+                }
+                // Primary path: RPC GUI SendInputEvent — works on BLE RPC-only connections
+                // Fallback: raw CLI `input send` — works on USB/CLI connections
+                val rpcResult = fileSystem.sendInputEvent(key, pressType)
+                val output = when (rpcResult) {
+                    is ProtocolResponse.Success -> rpcResult.message
+                    else -> fileSystem.executeCli("input send $key $pressType").getOrThrow()
+                }
+                CommandResultData(
+                    content = output,
+                    message = "Sent input: $key $pressType"
+                )
+            }
+
+            CommandAction.POWER_CONTROL -> {
+                val op = (command.args.operation ?: command.args.command ?: "reboot").lowercase()
+                val cliCommand = when (op) {
+                    "off", "power_off", "poweroff", "shutdown" -> "power off"
+                    "reboot", "restart" -> "power reboot"
+                    "dfu", "reboot_dfu", "recovery" -> "power reboot_dfu"
+                    else -> throw IllegalArgumentException(
+                        "Invalid operation '$op'. Valid: off, reboot, reboot_dfu"
+                    )
+                }
+                val output = fileSystem.executeCli(cliCommand).getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "Power: $cliCommand"
+                )
+            }
+
+            CommandAction.LOADER_LIST -> {
+                val output = fileSystem.executeCli("loader list").getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "Listed apps from loader"
+                )
+            }
+
+            CommandAction.LOADER_CLOSE -> {
+                val output = fileSystem.executeCli("loader close").getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "Closed foreground app"
+                )
+            }
+
+            CommandAction.BUZZER -> {
+                val noteOrFreq = command.args.note ?: command.args.command
+                    ?: throw IllegalArgumentException("note or frequency required (e.g. 'A4', '440')")
+                val durationMs = command.args.durationMs ?: 200
+                // Momentum firmware CLI: `buzzer note <note_name> <duration>[ms|s]`
+                //                        `buzzer freq <hz> <duration>[ms|s]`
+                val isNumeric = noteOrFreq.all { it.isDigit() || it == '.' }
+                val subCmd = if (isNumeric) "freq" else "note"
+                val output = fileSystem.executeCli("buzzer $subCmd $noteOrFreq ${durationMs}ms").getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "Played $subCmd $noteOrFreq for ${durationMs}ms"
+                )
+            }
+
+            CommandAction.ASSET_PACK_LIST -> {
+                // Asset packs live at /ext/asset_packs/<pack_name>/
+                val entries = fileSystem.listDirectory("/ext/asset_packs").getOrThrow()
+                val packNames = entries.filter { it.isDirectory }.map { it.name }
+                val content = if (packNames.isEmpty()) {
+                    "No asset packs found in /ext/asset_packs/"
+                } else {
+                    "Available asset packs:\n" + packNames.joinToString("\n") { "  - $it" }
+                }
+                CommandResultData(
+                    entries = entries.filter { it.isDirectory },
+                    content = content,
+                    message = "Found ${packNames.size} asset pack(s)"
+                )
+            }
+
+            CommandAction.ASSET_PACK_SET -> {
+                val packName = command.args.packName
+                    ?: command.args.command
+                    ?: throw IllegalArgumentException("pack_name required")
+                val settingsPath = "/ext/momentum/settings"
+                val currentSettings = fileSystem.readFile(settingsPath).getOrElse { "" }
+                val newSettings = if (currentSettings.contains("AssetPack=")) {
+                    currentSettings.replace(Regex("AssetPack=[^\n]*"), "AssetPack=$packName")
+                } else {
+                    currentSettings.trimEnd() + "\nAssetPack=$packName\n"
+                }
+                val bytesWritten = fileSystem.writeFile(settingsPath, newSettings).getOrThrow()
+                CommandResultData(
+                    bytesWritten = bytesWritten,
+                    message = "Asset pack set to: $packName (restart Flipper to apply)"
+                )
+            }
+
+            // ── Batch A: Sub-GHz extended ─────────────────────────
+
+            CommandAction.SUBGHZ_RECEIVE -> {
+                val freq = command.args.frequency
+                    ?: throw IllegalArgumentException("frequency required (e.g. 433920000)")
+                val output = fileSystem.executeCli("subghz rx $freq").getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "Receiving Sub-GHz at ${freq}Hz"
+                )
+            }
+
+            CommandAction.SUBGHZ_DECODE -> {
+                val path = command.args.path
+                    ?: throw IllegalArgumentException("path to .sub file required")
+                val output = fileSystem.executeCli("subghz decode_raw $path").getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "Decoded Sub-GHz file: $path"
+                )
+            }
+
+            CommandAction.SUBGHZ_CHAT -> {
+                val freq = command.args.frequency
+                    ?: throw IllegalArgumentException("frequency required (e.g. 433920000)")
+                val output = fileSystem.executeCli("subghz chat $freq").getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "Sub-GHz chat opened at ${freq}Hz"
+                )
+            }
+
+            // ── Batch B: Infrared extended ────────────────────────
+
+            CommandAction.IR_RECEIVE -> {
+                val output = fileSystem.executeCli("ir rx").getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "IR receive started"
+                )
+            }
+
+            CommandAction.IR_UNIVERSAL -> {
+                val category = command.args.category
+                    ?: command.args.command
+                    ?: throw IllegalArgumentException("category required (e.g. 'TVs', 'ACs', 'Projectors')")
+                val signal = command.args.signalName ?: ""
+                val cmd = if (signal.isNotBlank()) {
+                    "ir universal $category $signal"
+                } else {
+                    "ir universal $category"
+                }
+                val output = fileSystem.executeCli(cmd).getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "IR universal: $category${if (signal.isNotBlank()) "/$signal" else ""}"
+                )
+            }
+
+            // ── Batch C: NFC suite ────────────────────────────────
+
+            CommandAction.NFC_FIELD -> {
+                val on = command.args.enabled ?: true
+                val output = fileSystem.executeCli("nfc field ${if (on) "on" else "off"}").getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "NFC field ${if (on) "enabled" else "disabled"}"
+                )
+            }
+
+            CommandAction.NFC_APDU -> {
+                val apdu = command.args.dataHex
+                    ?: command.args.command
+                    ?: throw IllegalArgumentException("data_hex required (APDU hex string, e.g. '00A4040007...')")
+                val output = fileSystem.executeCli("nfc apdu $apdu").getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "Sent APDU: $apdu"
+                )
+            }
+
+            CommandAction.NFC_DUMP -> {
+                val path = command.args.path
+                    ?: throw IllegalArgumentException("path required (destination .nfc file, e.g. /ext/nfc/dump.nfc)")
+                val output = fileSystem.executeCli("nfc dump $path").getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "NFC dump saved to: $path"
+                )
+            }
+
+            CommandAction.NFC_SCANNER -> {
+                val output = fileSystem.executeCli("nfc scanner").getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "NFC scanner started"
+                )
+            }
+
+            // ── Batch D: GPIO / I2C / Power extended ─────────────
+
+            CommandAction.GPIO_CONTROL -> {
+                val op = (command.args.operation ?: command.args.command ?: "get").lowercase()
+                val pin = command.args.pin
+                    ?: throw IllegalArgumentException("pin required (e.g. 'PA7', 'PB3', 'PC3')")
+                val cliCommand = when (op) {
+                    "set" -> {
+                        val value = command.args.content ?: command.args.dataHex
+                            ?: throw IllegalArgumentException("content required: '0' or '1'")
+                        "gpio set $pin $value"
+                    }
+                    "get" -> "gpio get $pin"
+                    "mode" -> {
+                        val mode = command.args.gpioMode
+                            ?: throw IllegalArgumentException("gpio_mode required: input/output/analog/opendrain")
+                        "gpio mode $pin $mode"
+                    }
+                    else -> throw IllegalArgumentException("Invalid operation '$op'. Valid: set, get, mode")
+                }
+                val output = fileSystem.executeCli(cliCommand).getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "GPIO $op on $pin"
+                )
+            }
+
+            CommandAction.I2C_CONTROL -> {
+                val op = (command.args.operation ?: command.args.command ?: "scan").lowercase()
+                val cliCommand = when (op) {
+                    "scan" -> "i2c scan"
+                    "read" -> {
+                        val addr = command.args.address
+                            ?: throw IllegalArgumentException("address required (hex, e.g. '48')")
+                        val reg = command.args.register
+                            ?: throw IllegalArgumentException("register required (decimal, e.g. 0)")
+                        val len = command.args.durationMs ?: 1
+                        "i2c read $addr $reg $len"
+                    }
+                    "write" -> {
+                        val addr = command.args.address
+                            ?: throw IllegalArgumentException("address required")
+                        val reg = command.args.register
+                            ?: throw IllegalArgumentException("register required")
+                        val data = command.args.dataHex
+                            ?: throw IllegalArgumentException("data_hex required")
+                        "i2c write $addr $reg $data"
+                    }
+                    else -> throw IllegalArgumentException("Invalid operation '$op'. Valid: scan, read, write")
+                }
+                val output = fileSystem.executeCli(cliCommand).getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "I2C $op"
+                )
+            }
+
+            CommandAction.POWER_RAIL -> {
+                val op = (command.args.operation ?: command.args.command ?: "")
+                    .lowercase().replace("_", "")
+                val cliCommand = when {
+                    op.contains("5v") && (op.contains("on") || op.contains("1")) -> "power 5v 1"
+                    op.contains("5v") && (op.contains("off") || op.contains("0")) -> "power 5v 0"
+                    op.contains("3v3") && (op.contains("on") || op.contains("1")) -> "power 3v3 1"
+                    op.contains("3v3") && (op.contains("off") || op.contains("0")) -> "power 3v3 0"
+                    else -> throw IllegalArgumentException(
+                        "Invalid operation '$op'. Use: 5v_on, 5v_off, 3v3_on, 3v3_off"
+                    )
+                }
+                val output = fileSystem.executeCli(cliCommand).getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "Power rail: $cliCommand"
+                )
+            }
+
+            // ── Batch E: JavaScript engine ────────────────────────
+
+            CommandAction.JS_RUN -> {
+                val scriptPath = command.args.path
+                    ?: command.args.command
+                    ?: throw IllegalArgumentException("path to .js file required (e.g. /ext/scripts/myscript.js)")
+                // Primary: Momentum `js <path>` CLI (works when CLI is available)
+                // Fallback: loader open via RPC app bridge (works on BLE RPC-only connections)
+                val output = fileSystem.executeCli("js $scriptPath")
+                    .getOrElse {
+                        fileSystem.executeCli("loader open \"JavaScript Runner\" $scriptPath").getOrThrow()
+                    }
+                CommandResultData(
+                    content = output,
+                    message = "Executed JS: $scriptPath"
+                )
+            }
+
+            // ── Batch F: Momentum settings / display ─────────────
+
+            CommandAction.RGB_BACKLIGHT -> {
+                val preset = command.args.preset
+                val r = command.args.red
+                val g = command.args.green
+                val b = command.args.blue
+
+                val settingsPath = "/ext/momentum/settings"
+                val currentSettings = fileSystem.readFile(settingsPath).getOrElse { "" }
+
+                val presetValue = when {
+                    preset != null -> preset.coerceIn(0, 20)
+                    r != null || g != null || b != null -> {
+                        // Custom RGB → write as led_control too
+                        fileSystem.executeCli("led ${r ?: 0} ${g ?: 0} ${b ?: 0}")
+                        -1 // skip settings write for live preview
+                    }
+                    else -> throw IllegalArgumentException(
+                        "preset (0-20) or red/green/blue values required"
+                    )
+                }
+
+                if (presetValue >= 0) {
+                    val newSettings = if (currentSettings.contains("RgbBacklight=")) {
+                        currentSettings.replace(Regex("RgbBacklight=[^\n]*"), "RgbBacklight=$presetValue")
+                    } else {
+                        currentSettings.trimEnd() + "\nRgbBacklight=$presetValue\n"
+                    }
+                    fileSystem.writeFile(settingsPath, newSettings).getOrThrow()
+                }
+
+                val presetName = when (presetValue) {
+                    0 -> "off"
+                    20 -> "rainbow"
+                    -1 -> "custom RGB(${r ?: 0},${g ?: 0},${b ?: 0})"
+                    else -> "preset $presetValue"
+                }
+                CommandResultData(
+                    message = "RGB backlight set to $presetName${if (presetValue >= 0) " (restart to apply)" else ""}"
+                )
+            }
+
+            CommandAction.MOMENTUM_SETTING -> {
+                val settingKey = command.args.settingKey
+                    ?: throw IllegalArgumentException("setting_key required (e.g. 'MenuStyle', 'LockOnBoot')")
+                val settingValue = command.args.settingValue
+
+                val settingsPath = "/ext/momentum/settings"
+                val currentSettings = fileSystem.readFile(settingsPath).getOrElse { "" }
+
+                if (settingValue == null) {
+                    // Read mode
+                    val line = currentSettings.lines()
+                        .firstOrNull { it.startsWith("$settingKey=") }
+                    CommandResultData(
+                        content = line ?: "$settingKey not found in settings",
+                        message = "Read Momentum setting: $settingKey"
+                    )
+                } else {
+                    // Write mode
+                    val newSettings = if (currentSettings.contains("$settingKey=")) {
+                        currentSettings.replace(Regex("$settingKey=[^\n]*"), "$settingKey=$settingValue")
+                    } else {
+                        currentSettings.trimEnd() + "\n$settingKey=$settingValue\n"
+                    }
+                    val bytesWritten = fileSystem.writeFile(settingsPath, newSettings).getOrThrow()
+                    CommandResultData(
+                        bytesWritten = bytesWritten,
+                        message = "Momentum setting: $settingKey=$settingValue (restart to apply)"
+                    )
+                }
+            }
+
+            CommandAction.DEVICE_SPOOF -> {
+                val name = command.args.content
+                    ?: command.args.command
+                    ?: throw IllegalArgumentException("content required (new device name)")
+                val sanitized = name.take(64).replace('\n', ' ').replace('\r', ' ')
+                val bytesWritten = fileSystem.writeFile(
+                    "/ext/dolphin/name.settings",
+                    "Name: $sanitized\n"
+                ).getOrThrow()
+                CommandResultData(
+                    bytesWritten = bytesWritten,
+                    message = "Device name set to: $sanitized"
+                )
+            }
+
+            CommandAction.LOADER_SIGNAL -> {
+                val signalId = command.args.signalId
+                    ?: command.args.command?.toIntOrNull()
+                    ?: throw IllegalArgumentException("signal_id required (integer)")
+                val arg = command.args.content ?: ""
+                val cliCommand = if (arg.isNotBlank()) {
+                    "loader signal $signalId $arg"
+                } else {
+                    "loader signal $signalId"
+                }
+                val output = fileSystem.executeCli(cliCommand).getOrThrow()
+                CommandResultData(
+                    content = output,
+                    message = "Sent signal $signalId to running app"
                 )
             }
         }

@@ -116,7 +116,117 @@ enum class CommandAction {
     // ── Smartglasses camera ───────────────────────────────────
 
     @SerialName("request_photo")
-    REQUEST_PHOTO
+    REQUEST_PHOTO,
+
+    // ── Momentum Firmware exclusive actions ───────────────────
+
+    /** Send a hardware button event to the Flipper UI (Momentum: `input send <key> <type>`). */
+    @SerialName("input_send")
+    INPUT_SEND,
+
+    /** Power off, reboot, or enter DFU/recovery mode (`power off|reboot|reboot_dfu`). */
+    @SerialName("power_control")
+    POWER_CONTROL,
+
+    /** List all installed/available apps on the Flipper (`loader list`). */
+    @SerialName("loader_list")
+    LOADER_LIST,
+
+    /** Close the currently running foreground app (`loader close`). */
+    @SerialName("loader_close")
+    LOADER_CLOSE,
+
+    /** Play a tone on the Flipper buzzer (`music_player` / `buzzer`). */
+    @SerialName("buzzer")
+    BUZZER,
+
+    /** List available asset packs from `/ext/asset_packs/`. */
+    @SerialName("asset_pack_list")
+    ASSET_PACK_LIST,
+
+    /** Switch to a different asset pack (updates Momentum settings file). */
+    @SerialName("asset_pack_set")
+    ASSET_PACK_SET,
+
+    // ── Batch A: Sub-GHz extended ─────────────────────────────
+
+    /** Receive and decode a Sub-GHz signal at a given frequency (`subghz rx <freq>`). */
+    @SerialName("subghz_receive")
+    SUBGHZ_RECEIVE,
+
+    /** Decode a previously captured RAW .sub file (`subghz decode_raw <path>`). */
+    @SerialName("subghz_decode")
+    SUBGHZ_DECODE,
+
+    /** Open Sub-GHz text chat at a frequency (`subghz chat <freq>`). */
+    @SerialName("subghz_chat")
+    SUBGHZ_CHAT,
+
+    // ── Batch B: Infrared extended ────────────────────────────
+
+    /** Receive and decode an incoming IR signal (`ir rx`). */
+    @SerialName("ir_receive")
+    IR_RECEIVE,
+
+    /** Brute-force transmit all signals from a universal remote category (`ir universal <remote> <signal>`). */
+    @SerialName("ir_universal")
+    IR_UNIVERSAL,
+
+    // ── Batch C: NFC suite ────────────────────────────────────
+
+    /** Toggle NFC field on/off (`nfc field`). */
+    @SerialName("nfc_field")
+    NFC_FIELD,
+
+    /** Send raw APDU command to an NFC tag (`nfc apdu <hex>`). */
+    @SerialName("nfc_apdu")
+    NFC_APDU,
+
+    /** Dump full NFC tag contents to a file (`nfc dump <path>`). */
+    @SerialName("nfc_dump")
+    NFC_DUMP,
+
+    /** Passive NFC scanner — detect tags and report UID/type (`nfc scanner`). */
+    @SerialName("nfc_scanner")
+    NFC_SCANNER,
+
+    // ── Batch D: GPIO / I2C / Power extended ─────────────────
+
+    /** Read or write a GPIO pin (`gpio set|get|mode <pin> [value]`). */
+    @SerialName("gpio_control")
+    GPIO_CONTROL,
+
+    /** Scan or read/write the I2C bus (`i2c scan|read|write ...`). */
+    @SerialName("i2c_control")
+    I2C_CONTROL,
+
+    /** Control external power rails (`power 5v|3v3 <0|1>`). */
+    @SerialName("power_rail")
+    POWER_RAIL,
+
+    // ── Batch E: JavaScript engine ────────────────────────────
+
+    /** Execute a JavaScript file via Momentum JS engine (`js <path>`). */
+    @SerialName("js_run")
+    JS_RUN,
+
+    // ── Batch F: Momentum settings / display ─────────────────
+
+    /** Set RGB backlight color preset (Momentum exclusive). */
+    @SerialName("rgb_backlight")
+    RGB_BACKLIGHT,
+
+    /** Read or write any Momentum settings key in `/ext/momentum/settings`. */
+    @SerialName("momentum_setting")
+    MOMENTUM_SETTING,
+
+    /** Spoof the Flipper device name shown on screen. */
+    @SerialName("device_spoof")
+    DEVICE_SPOOF,
+
+    /** Send a signal to the currently running app (`loader signal <id> [arg]`). */
+    @SerialName("loader_signal")
+    LOADER_SIGNAL
 }
 
 @Serializable
@@ -165,7 +275,47 @@ data class CommandArgs(
     @SerialName("search_scope")
     val searchScope: String? = null,
     @SerialName("photo_prompt")
-    val photoPrompt: String? = null
+    val photoPrompt: String? = null,
+
+    // Momentum-specific args
+    /** Hardware button key for input_send: up / down / left / right / ok / back / unlock */
+    val key: String? = null,
+    /** Press type for input_send: press / release / short / long */
+    @SerialName("press_type")
+    val pressType: String? = null,
+    /** Power operation: off / reboot / reboot_dfu / 5v_on / 5v_off / 3v3_on / 3v3_off */
+    val operation: String? = null,
+    /** Asset pack name for asset_pack_set */
+    @SerialName("pack_name")
+    val packName: String? = null,
+    /** Musical note or frequency string for buzzer (e.g. "A4", "440") */
+    val note: String? = null,
+    /** Duration in milliseconds for buzzer */
+    @SerialName("duration_ms")
+    val durationMs: Int? = null,
+    /** GPIO pin name for gpio_control (e.g. "PA7", "PB3", "PC3") */
+    val pin: String? = null,
+    /** GPIO mode for gpio_control: input / output / analog / opendrain */
+    @SerialName("gpio_mode")
+    val gpioMode: String? = null,
+    /** I2C register address (0-255) for i2c_control read/write */
+    val register: Int? = null,
+    /** Hex data string for i2c_control write or nfc_apdu command */
+    @SerialName("data_hex")
+    val dataHex: String? = null,
+    /** RGB backlight preset: 0=off, 1-19=color preset, 20=rainbow */
+    val preset: Int? = null,
+    /** Momentum setting key for momentum_setting (e.g. "MenuStyle", "LockOnBoot") */
+    @SerialName("setting_key")
+    val settingKey: String? = null,
+    /** Momentum setting value for momentum_setting (e.g. "Wii", "false") */
+    @SerialName("setting_value")
+    val settingValue: String? = null,
+    /** Signal ID for loader_signal */
+    @SerialName("signal_id")
+    val signalId: Int? = null,
+    /** IR universal remote category (e.g. "TVs", "ACs") for ir_universal */
+    val category: String? = null
 )
 
 /**

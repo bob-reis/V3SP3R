@@ -23,6 +23,10 @@ class FlipperFileSystem @Inject constructor(
     val firmwareCompatibility: StateFlow<FirmwareCompatibilityProfile>
         get() = protocol.firmwareCompatibility
 
+    /** Send a hardware input event via RPC GUI service. Works on BLE RPC-only connections. */
+    suspend fun sendInputEvent(key: String, pressType: String): ProtocolResponse =
+        protocol.sendRpcInputEvent(key, pressType)
+
     private val _autotuneStatus = MutableStateFlow(CommandPipelineAutotuneStatus())
     val autotuneStatus: StateFlow<CommandPipelineAutotuneStatus> = _autotuneStatus.asStateFlow()
     private val autotuneWindow = ArrayDeque<AutotuneSample>()
@@ -296,6 +300,8 @@ class FlipperFileSystem @Inject constructor(
             var initialRpcBridgeFailure: ProtocolResponse.Error? = null
 
             // Prefer RPC app bridge first for mapped commands to avoid slow CLI probing loops.
+            // Exception: CLI_PASSTHROUGH signals that the plan exists only to bypass
+            // the "no mapping" guard — the command must execute via raw CLI.
             if (canUseRpcBridge) {
                 when (val rpcBridgeResponse = executeRpcAppCommandWithRetry(validatedCommand)) {
                     is ProtocolResponse.Success,
@@ -304,7 +310,11 @@ class FlipperFileSystem @Inject constructor(
                         return finish(protocolResponseToStringResult(rpcBridgeResponse))
                     }
                     is ProtocolResponse.Error -> {
-                        initialRpcBridgeFailure = rpcBridgeResponse
+                        if (rpcBridgeResponse.message.startsWith("CLI_PASSTHROUGH:")) {
+                            // skipAppLaunch plan — fall through to raw CLI below
+                        } else {
+                            initialRpcBridgeFailure = rpcBridgeResponse
+                        }
                     }
                     else -> {
                         return finish(

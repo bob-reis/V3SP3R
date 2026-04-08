@@ -948,6 +948,37 @@ class OpenRouterClient @Inject constructor(
             "led_control", "set_led", "led" -> CommandAction.LED_CONTROL
             "vibro_control", "vibro", "vibration" -> CommandAction.VIBRO_CONTROL
             "request_photo", "take_photo", "capture_photo", "photo", "snap_photo" -> CommandAction.REQUEST_PHOTO
+            // Momentum — Batch 1
+            "input_send", "send_input", "press_button", "button_press" -> CommandAction.INPUT_SEND
+            "power_control", "power", "reboot", "shutdown", "power_off" -> CommandAction.POWER_CONTROL
+            "loader_list", "list_apps", "list_loader" -> CommandAction.LOADER_LIST
+            "loader_close", "close_app", "close_loader" -> CommandAction.LOADER_CLOSE
+            "loader_signal", "signal_app", "send_signal" -> CommandAction.LOADER_SIGNAL
+            "buzzer", "play_note", "beep", "sound" -> CommandAction.BUZZER
+            "asset_pack_list", "list_asset_packs", "list_packs" -> CommandAction.ASSET_PACK_LIST
+            "asset_pack_set", "set_asset_pack", "switch_pack", "set_pack" -> CommandAction.ASSET_PACK_SET
+            // Batch A: Sub-GHz extended
+            "subghz_receive", "subghz_rx", "subghz_listen", "receive_subghz" -> CommandAction.SUBGHZ_RECEIVE
+            "subghz_decode", "decode_subghz", "decode_raw" -> CommandAction.SUBGHZ_DECODE
+            "subghz_chat", "subghz_p2p", "subghz_message" -> CommandAction.SUBGHZ_CHAT
+            // Batch B: Infrared extended
+            "ir_receive", "ir_rx", "ir_listen", "receive_ir" -> CommandAction.IR_RECEIVE
+            "ir_universal", "ir_bruteforce", "universal_ir", "ir_brute" -> CommandAction.IR_UNIVERSAL
+            // Batch C: NFC suite
+            "nfc_field", "nfc_field_on", "nfc_field_off", "toggle_nfc_field" -> CommandAction.NFC_FIELD
+            "nfc_apdu", "send_apdu", "apdu" -> CommandAction.NFC_APDU
+            "nfc_dump", "dump_nfc", "nfc_read_dump" -> CommandAction.NFC_DUMP
+            "nfc_scanner", "nfc_scan", "scan_nfc" -> CommandAction.NFC_SCANNER
+            // Batch D: GPIO / I2C / Power extended
+            "gpio_control", "gpio", "gpio_set", "gpio_get" -> CommandAction.GPIO_CONTROL
+            "i2c_control", "i2c", "i2c_scan", "i2c_read", "i2c_write" -> CommandAction.I2C_CONTROL
+            "power_rail", "5v_control", "3v3_control", "otg_power" -> CommandAction.POWER_RAIL
+            // Batch E: JavaScript
+            "js_run", "run_js", "javascript", "js_execute", "run_script" -> CommandAction.JS_RUN
+            // Batch F: Momentum settings
+            "rgb_backlight", "backlight", "set_backlight", "backlight_color" -> CommandAction.RGB_BACKLIGHT
+            "momentum_setting", "momentum_set", "set_setting", "flipper_setting" -> CommandAction.MOMENTUM_SETTING
+            "device_spoof", "spoof_name", "set_name", "rename_device" -> CommandAction.DEVICE_SPOOF
             else -> null
         }
     }
@@ -1167,6 +1198,66 @@ class OpenRouterClient @Inject constructor(
             CommandAction.LED_CONTROL -> emptyList()  // defaults to 0,0,0
             CommandAction.VIBRO_CONTROL -> emptyList()  // defaults to on
             CommandAction.REQUEST_PHOTO -> emptyList()  // prompt is optional (has default)
+            // Momentum Firmware exclusive
+            CommandAction.INPUT_SEND -> listOfNotNull(if (args.key.isNullOrBlank()) "key" else null)
+            CommandAction.POWER_CONTROL -> emptyList()  // defaults to reboot
+            CommandAction.LOADER_LIST -> emptyList()
+            CommandAction.LOADER_CLOSE -> emptyList()
+            CommandAction.BUZZER -> {
+                if (args.note.isNullOrBlank() && args.command.isNullOrBlank()) {
+                    listOf("note")
+                } else {
+                    emptyList()
+                }
+            }
+            CommandAction.ASSET_PACK_LIST -> emptyList()
+            CommandAction.ASSET_PACK_SET -> {
+                if (args.packName.isNullOrBlank() && args.command.isNullOrBlank()) {
+                    listOf("pack_name")
+                } else {
+                    emptyList()
+                }
+            }
+            CommandAction.LOADER_SIGNAL -> {
+                if (args.signalId == null && args.command.isNullOrBlank()) listOf("signal_id") else emptyList()
+            }
+            // Batch A
+            CommandAction.SUBGHZ_RECEIVE -> listOfNotNull(if (args.frequency == null) "frequency" else null)
+            CommandAction.SUBGHZ_DECODE -> listOfNotNull(if (args.path.isNullOrBlank()) "path" else null)
+            CommandAction.SUBGHZ_CHAT -> listOfNotNull(if (args.frequency == null) "frequency" else null)
+            // Batch B
+            CommandAction.IR_RECEIVE -> emptyList()
+            CommandAction.IR_UNIVERSAL -> {
+                if (args.category.isNullOrBlank() && args.command.isNullOrBlank()) listOf("category") else emptyList()
+            }
+            // Batch C
+            CommandAction.NFC_FIELD -> emptyList()
+            CommandAction.NFC_APDU -> {
+                if (args.dataHex.isNullOrBlank() && args.command.isNullOrBlank()) listOf("data_hex") else emptyList()
+            }
+            CommandAction.NFC_DUMP -> listOfNotNull(if (args.path.isNullOrBlank()) "path" else null)
+            CommandAction.NFC_SCANNER -> emptyList()
+            // Batch D
+            CommandAction.GPIO_CONTROL -> listOfNotNull(if (args.pin.isNullOrBlank()) "pin" else null)
+            CommandAction.I2C_CONTROL -> emptyList()  // operation defaults to scan
+            CommandAction.POWER_RAIL -> {
+                if (args.operation.isNullOrBlank() && args.command.isNullOrBlank()) listOf("operation") else emptyList()
+            }
+            // Batch E
+            CommandAction.JS_RUN -> {
+                if (args.path.isNullOrBlank() && args.command.isNullOrBlank()) listOf("path") else emptyList()
+            }
+            // Batch F
+            CommandAction.RGB_BACKLIGHT -> {
+                val hasInput = args.preset != null || args.red != null || args.green != null || args.blue != null
+                if (!hasInput) listOf("preset") else emptyList()
+            }
+            CommandAction.MOMENTUM_SETTING -> {
+                if (args.settingKey.isNullOrBlank()) listOf("setting_key") else emptyList()
+            }
+            CommandAction.DEVICE_SPOOF -> {
+                if (args.content.isNullOrBlank() && args.command.isNullOrBlank()) listOf("content") else emptyList()
+            }
         }
     }
 
@@ -1224,6 +1315,61 @@ class OpenRouterClient @Inject constructor(
                 """{"action":"led_control","args":{"red":255,"green":0,"blue":0}}"""
             CommandAction.VIBRO_CONTROL ->
                 """{"action":"vibro_control","args":{"enabled":true}}"""
+            // Momentum Firmware exclusive
+            CommandAction.INPUT_SEND ->
+                """{"action":"input_send","args":{"key":"ok","press_type":"short"}}"""
+            CommandAction.POWER_CONTROL ->
+                """{"action":"power_control","args":{"operation":"reboot"}}"""
+            CommandAction.LOADER_LIST ->
+                """{"action":"loader_list","args":{}}"""
+            CommandAction.LOADER_CLOSE ->
+                """{"action":"loader_close","args":{}}"""
+            CommandAction.BUZZER ->
+                """{"action":"buzzer","args":{"note":"A4","duration_ms":300}}"""
+            CommandAction.ASSET_PACK_LIST ->
+                """{"action":"asset_pack_list","args":{}}"""
+            CommandAction.ASSET_PACK_SET ->
+                """{"action":"asset_pack_set","args":{"pack_name":"EvilEye"}}"""
+            CommandAction.LOADER_SIGNAL ->
+                """{"action":"loader_signal","args":{"signal_id":0}}"""
+            // Batch A
+            CommandAction.SUBGHZ_RECEIVE ->
+                """{"action":"subghz_receive","args":{"frequency":433920000}}"""
+            CommandAction.SUBGHZ_DECODE ->
+                """{"action":"subghz_decode","args":{"path":"/ext/subghz/capture.sub"}}"""
+            CommandAction.SUBGHZ_CHAT ->
+                """{"action":"subghz_chat","args":{"frequency":433920000}}"""
+            // Batch B
+            CommandAction.IR_RECEIVE ->
+                """{"action":"ir_receive","args":{}}"""
+            CommandAction.IR_UNIVERSAL ->
+                """{"action":"ir_universal","args":{"category":"TVs","signal_name":"Power"}}"""
+            // Batch C
+            CommandAction.NFC_FIELD ->
+                """{"action":"nfc_field","args":{"enabled":true}}"""
+            CommandAction.NFC_APDU ->
+                """{"action":"nfc_apdu","args":{"data_hex":"00A4040007D276000085010100"}}"""
+            CommandAction.NFC_DUMP ->
+                """{"action":"nfc_dump","args":{"path":"/ext/nfc/dump.nfc"}}"""
+            CommandAction.NFC_SCANNER ->
+                """{"action":"nfc_scanner","args":{}}"""
+            // Batch D
+            CommandAction.GPIO_CONTROL ->
+                """{"action":"gpio_control","args":{"operation":"set","pin":"PA7","content":"1"}}"""
+            CommandAction.I2C_CONTROL ->
+                """{"action":"i2c_control","args":{"operation":"scan"}}"""
+            CommandAction.POWER_RAIL ->
+                """{"action":"power_rail","args":{"operation":"5v_on"}}"""
+            // Batch E
+            CommandAction.JS_RUN ->
+                """{"action":"js_run","args":{"path":"/ext/scripts/myscript.js"}}"""
+            // Batch F
+            CommandAction.RGB_BACKLIGHT ->
+                """{"action":"rgb_backlight","args":{"preset":5}}"""
+            CommandAction.MOMENTUM_SETTING ->
+                """{"action":"momentum_setting","args":{"setting_key":"MenuStyle","setting_value":"Wii"}}"""
+            CommandAction.DEVICE_SPOOF ->
+                """{"action":"device_spoof","args":{"content":"BlackNet"}}"""
             CommandAction.BROWSE_REPO ->
                 """{"action":"browse_repo","args":{"repo_id":"irdb","sub_path":"TVs/Samsung"}}"""
             CommandAction.DOWNLOAD_RESOURCE ->
@@ -1437,7 +1583,38 @@ class OpenRouterClient @Inject constructor(
             "ble_spam",
             "led_control",
             "vibro_control",
-            "request_photo"
+            "request_photo",
+            // Momentum — Batch 1
+            "input_send",
+            "power_control",
+            "loader_list",
+            "loader_close",
+            "loader_signal",
+            "buzzer",
+            "asset_pack_list",
+            "asset_pack_set",
+            // Batch A: Sub-GHz
+            "subghz_receive",
+            "subghz_decode",
+            "subghz_chat",
+            // Batch B: Infrared
+            "ir_receive",
+            "ir_universal",
+            // Batch C: NFC
+            "nfc_field",
+            "nfc_apdu",
+            "nfc_dump",
+            "nfc_scanner",
+            // Batch D: GPIO / I2C / Power
+            "gpio_control",
+            "i2c_control",
+            "power_rail",
+            // Batch E: JavaScript
+            "js_run",
+            // Batch F: Settings
+            "rgb_backlight",
+            "momentum_setting",
+            "device_spoof"
         )
 
         private val TOOL_USE_FALLBACK_MODELS = listOf(
@@ -1512,9 +1689,40 @@ class OpenRouterClient @Inject constructor(
                                 JsonPrimitive("browse_repo"),
                                 JsonPrimitive("download_resource"),
                                 JsonPrimitive("github_search"),
-                                JsonPrimitive("request_photo")
+                                JsonPrimitive("request_photo"),
+                                // Momentum Firmware exclusive — Batch 1
+                                JsonPrimitive("input_send"),
+                                JsonPrimitive("power_control"),
+                                JsonPrimitive("loader_list"),
+                                JsonPrimitive("loader_close"),
+                                JsonPrimitive("loader_signal"),
+                                JsonPrimitive("buzzer"),
+                                JsonPrimitive("asset_pack_list"),
+                                JsonPrimitive("asset_pack_set"),
+                                // Batch A: Sub-GHz extended
+                                JsonPrimitive("subghz_receive"),
+                                JsonPrimitive("subghz_decode"),
+                                JsonPrimitive("subghz_chat"),
+                                // Batch B: Infrared extended
+                                JsonPrimitive("ir_receive"),
+                                JsonPrimitive("ir_universal"),
+                                // Batch C: NFC suite
+                                JsonPrimitive("nfc_field"),
+                                JsonPrimitive("nfc_apdu"),
+                                JsonPrimitive("nfc_dump"),
+                                JsonPrimitive("nfc_scanner"),
+                                // Batch D: GPIO / I2C / Power extended
+                                JsonPrimitive("gpio_control"),
+                                JsonPrimitive("i2c_control"),
+                                JsonPrimitive("power_rail"),
+                                // Batch E: JavaScript
+                                JsonPrimitive("js_run"),
+                                // Batch F: Momentum settings / display
+                                JsonPrimitive("rgb_backlight"),
+                                JsonPrimitive("momentum_setting"),
+                                JsonPrimitive("device_spoof")
                             )),
-                            "description" to JsonPrimitive("The action to perform on the Flipper Zero (request_photo requires smart glasses)")
+                            "description" to JsonPrimitive("The action to perform on the Flipper Zero (request_photo requires smart glasses; input_send/power_control/loader_*/buzzer/asset_pack_* require Momentum firmware)")
                         )),
                         "args" to JsonObject(mapOf(
                             "type" to JsonPrimitive("object"),
@@ -1640,6 +1848,68 @@ class OpenRouterClient @Inject constructor(
                                 "photo_prompt" to JsonObject(mapOf(
                                     "type" to JsonPrimitive("string"),
                                     "description" to JsonPrimitive("Vision analysis prompt for request_photo. Describe what you want to identify (e.g. 'Identify the TV brand and model', 'What device is this?'). Falls back to 'prompt' if not set.")
+                                )),
+                                // Momentum-exclusive args
+                                "key" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("string"),
+                                    "description" to JsonPrimitive("Hardware button key for input_send (Momentum). Values: up / down / left / right / ok / back / unlock")
+                                )),
+                                "press_type" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("string"),
+                                    "description" to JsonPrimitive("Press type for input_send (Momentum). Values: press / release / short (default) / long")
+                                )),
+                                "operation" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("string"),
+                                    "description" to JsonPrimitive("Power operation for power_control (Momentum). Values: off (shut down), reboot (restart), reboot_dfu (enter DFU/recovery)")
+                                )),
+                                "pack_name" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("string"),
+                                    "description" to JsonPrimitive("Asset pack folder name for asset_pack_set (Momentum). Use asset_pack_list first to see available packs.")
+                                )),
+                                "note" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("string"),
+                                    "description" to JsonPrimitive("Musical note or frequency for buzzer (Momentum). Examples: 'A4', 'C5', 'G3', or raw Hz like '440'.")
+                                )),
+                                "duration_ms" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("integer"),
+                                    "description" to JsonPrimitive("Note duration in milliseconds for buzzer (Momentum). Default: 200. Also used as byte-length for i2c_control read.")
+                                )),
+                                // Batch A-D args
+                                "category" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("string"),
+                                    "description" to JsonPrimitive("IR universal remote category for ir_universal (e.g. 'TVs', 'ACs', 'Projectors', 'Audio').")
+                                )),
+                                "data_hex" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("string"),
+                                    "description" to JsonPrimitive("Hex data string. For nfc_apdu: APDU command hex (e.g. '00A4040007...'). For i2c_control write: bytes to write.")
+                                )),
+                                "pin" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("string"),
+                                    "description" to JsonPrimitive("GPIO pin name for gpio_control (e.g. 'PA7', 'PB3', 'PC3', 'PC1').")
+                                )),
+                                "gpio_mode" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("string"),
+                                    "description" to JsonPrimitive("GPIO pin mode for gpio_control mode operation: input / output / analog / opendrain.")
+                                )),
+                                "register" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("integer"),
+                                    "description" to JsonPrimitive("I2C register address (0-255) for i2c_control read/write operations.")
+                                )),
+                                "preset" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("integer"),
+                                    "description" to JsonPrimitive("RGB backlight preset for rgb_backlight: 0=off, 1-19=color preset, 20=rainbow. Requires Momentum.")
+                                )),
+                                "setting_key" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("string"),
+                                    "description" to JsonPrimitive("Momentum setting key for momentum_setting (e.g. 'MenuStyle', 'LockOnBoot', 'RgbBacklight', 'BatteryIcon', 'AssetPack', 'FavoriteTimeout').")
+                                )),
+                                "setting_value" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("string"),
+                                    "description" to JsonPrimitive("Momentum setting value for momentum_setting. Omit to read the current value. Examples: 'Wii', 'false', '20', 'EvilEye'.")
+                                )),
+                                "signal_id" to JsonObject(mapOf(
+                                    "type" to JsonPrimitive("integer"),
+                                    "description" to JsonPrimitive("Signal ID integer for loader_signal. Sent to the currently running app's signal handler.")
                                 ))
                             ))
                         )),

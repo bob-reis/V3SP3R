@@ -60,6 +60,7 @@ class FlipperBleService : Service() {
     private var connectedUsbDevice: UsbDevice? = null
     private var usbReadJob: Job? = null
     private var bleKeepaliveJob: Job? = null
+    private var notificationSetupTimeoutJob: Job? = null
     private var usbReceiverRegistered = false
     private var broadScanStarted = false
 
@@ -71,6 +72,8 @@ class FlipperBleService : Service() {
 
     private val _connectedDevice = MutableStateFlow<FlipperDevice?>(null)
     val connectedDevice: StateFlow<FlipperDevice?> = _connectedDevice.asStateFlow()
+    private val _transportTelemetry = MutableStateFlow(TransportTelemetry.idle())
+    val transportTelemetry: StateFlow<TransportTelemetry> = _transportTelemetry.asStateFlow()
     val cliCapabilityStatus: StateFlow<CliCapabilityStatus>
         get() = flipperProtocol.cliStatus
 
@@ -118,6 +121,8 @@ class FlipperBleService : Service() {
     private var lastBleActivityAtMs: Long = 0L
     @Volatile
     private var lastBlePriorityRequestAtMs: Long = 0L
+    @Volatile
+    private var bleWriteRouteVerified: Boolean = false
 
     private val usbBroadcastReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -191,6 +196,7 @@ class FlipperBleService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         unregisterUsbReceivers()
+        notificationSetupTimeoutJob?.cancel()
         disconnect()
         serviceScope.cancel()
     }
@@ -584,6 +590,7 @@ class FlipperBleService : Service() {
             usbDeviceConnection = connection
             connectedUsbDevice = device
             activeTransport = CommandTransport.USB
+            refreshTransportTelemetry()
             flipperProtocol.onConnectionReset()
             startUsbReadLoop()
 
@@ -873,21 +880,11 @@ class FlipperBleService : Service() {
 
     @SuppressLint("MissingPermission")
     private fun sendBleKeepaliveProbe() {
-        if (!hasBluetoothPermissions()) return
-        val gatt = bluetoothGatt ?: return
-        if (!isCurrentGatt(gatt)) return
-
-        val sent = when {
-            serialOverflowCharacteristic != null -> {
-                gatt.readCharacteristic(serialOverflowCharacteristic)
-            }
-            else -> {
-                gatt.readRemoteRssi()
-            }
-        }
-        if (sent) {
-            markBleActivity()
-        }
+        // Intentionally a no-op: any GATT operation (readRemoteRssi, readCharacteristic)
+        // sets mDeviceBusy=true and can race with RPC command writes, causing them to
+        // return false (Gatt rejected write). The BLE supervision timeout keeps the
+        // link alive on its own; if the connection drops, auto-reconnect handles it.
+        markBleActivity()
     }
 
     @SuppressLint("MissingPermission")
@@ -1014,14 +1011,21 @@ class FlipperBleService : Service() {
                             gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                         }
                         lastBlePriorityRequestAtMs = System.currentTimeMillis()
+                        // Request MTU first and wait for onMtuChanged before calling
+                        // discoverServices. Calling both simultaneously can corrupt Android's
+                        // mDeviceBusy state: if onServicesDiscovered fires while the MTU op
+                        // still has mDeviceBusy=true, the subsequent writeDescriptor (CCCD)
+                        // returns false and all future GATT writes are permanently blocked.
                         gatt.requestMtu(REQUESTED_ATT_MTU)
-                        gatt.discoverServices()
                     }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
+                    notificationSetupTimeoutJob?.cancel()
+                    notificationSetupTimeoutJob = null
                     failPendingWriteAck()
                     flipperProtocol.onConnectionReset()
                     gattLinkConnected = false
+                    bleWriteRouteVerified = false
                     notificationsReady = false
                     pendingConnectedDevice = null
                     negotiatedMtu = DEFAULT_ATT_MTU
@@ -1038,6 +1042,7 @@ class FlipperBleService : Service() {
                     if (activeTransport == CommandTransport.BLE) {
                         activeTransport = CommandTransport.NONE
                     }
+                    refreshTransportTelemetry()
                     val autoReconnectScheduled = scheduleAutoReconnectIfEligible(status)
                     _connectionState.value = if (autoReconnectScheduled) {
                         val deviceName = lastRequestedDeviceName
@@ -1074,6 +1079,7 @@ class FlipperBleService : Service() {
 
             val serialService = resolveSerialService(gatt)
             if (serialService == null) {
+                logDiscoveredGattTopology(gatt)
                 val discoveredServices = gatt.services
                     ?.joinToString(limit = 8) { it.uuid.toString() }
                     .orEmpty()
@@ -1092,10 +1098,14 @@ class FlipperBleService : Service() {
             serialOverflowCharacteristic = serialService.getCharacteristic(FLIPPER_SERIAL_OVERFLOW_UUID)
             serialResetCharacteristic = serialService.getCharacteristic(FLIPPER_SERIAL_RESET_UUID)
             remainingSerialBufferBytes = null
+            refreshTransportTelemetry()
             if (serialCharacteristic == null || serialRxCharacteristic == null) {
+                logDiscoveredGattTopology(gatt)
                 _connectionState.value = ConnectionState.Error("Flipper serial characteristics not usable")
                 return
             }
+
+            logResolvedSerialTopology(serialService, resolvedWrite, resolvedNotify)
 
             val deviceName = resolveConnectedDeviceName(gatt.device.address, gatt.device.name)
             val device = FlipperDevice(
@@ -1126,6 +1136,8 @@ class FlipperBleService : Service() {
                     if (!started) {
                         pendingConnectedDevice = null
                         _connectionState.value = ConnectionState.Error("Failed to enable Flipper notifications")
+                    } else {
+                        scheduleNotificationSetupTimeout(gatt, device, rx)
                     }
                     return
                 }
@@ -1144,6 +1156,8 @@ class FlipperBleService : Service() {
             if (!isCurrentGatt(gatt)) return
             if (descriptor.uuid != CLIENT_CHARACTERISTIC_CONFIG) return
             if (descriptor.characteristic?.uuid != serialRxCharacteristic?.uuid) return
+            notificationSetupTimeoutJob?.cancel()
+            notificationSetupTimeoutJob = null
 
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 pendingConnectedDevice = null
@@ -1160,10 +1174,17 @@ class FlipperBleService : Service() {
             }
         }
 
+        @SuppressLint("MissingPermission")
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             if (!isCurrentGatt(gatt)) return
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 negotiatedMtu = mtu.coerceIn(DEFAULT_ATT_MTU, REQUESTED_ATT_MTU)
+            }
+            // Start service discovery only after the MTU exchange completes: the MTU
+            // op clears mDeviceBusy here, so writeDescriptor (CCCD) inside
+            // onServicesDiscovered will find mDeviceBusy=false and succeed.
+            if (hasBluetoothPermissions() && gattLinkConnected) {
+                gatt.discoverServices()
             }
         }
 
@@ -1179,6 +1200,8 @@ class FlipperBleService : Service() {
                 return
             }
             if (shouldHandleIncomingCharacteristic(characteristic)) {
+                bleWriteRouteVerified = true
+                recordRxTelemetry(value)
                 completePendingOperation(value)
                 flipperProtocol.processIncomingData(value)
             }
@@ -1196,6 +1219,8 @@ class FlipperBleService : Service() {
             }
             if (shouldHandleIncomingCharacteristic(characteristic)) {
                 characteristic.value?.let { data ->
+                    bleWriteRouteVerified = true
+                    recordRxTelemetry(data)
                     completePendingOperation(data)
                     flipperProtocol.processIncomingData(data)
                 }
@@ -1262,8 +1287,10 @@ class FlipperBleService : Service() {
         ignoreOverflowBudget: Boolean = false
     ): Boolean {
         lastWriteFailureReason = null
+        refreshTransportTelemetry()
         if (!awaitCommandTransportReady()) {
             lastWriteFailureReason = "Command transport not ready"
+            refreshTransportTelemetry()
             return false
         }
 
@@ -1315,11 +1342,13 @@ class FlipperBleService : Service() {
     ): Boolean {
         if (!hasBluetoothPermissions()) {
             lastWriteFailureReason = "Bluetooth permission missing"
+            refreshTransportTelemetry()
             return false
         }
 
         val characteristic = serialCharacteristic ?: run {
             lastWriteFailureReason = "Serial TX characteristic unavailable"
+            refreshTransportTelemetry()
             return false
         }
         if (!notificationsReady) {
@@ -1330,6 +1359,7 @@ class FlipperBleService : Service() {
             }
             if (!notificationsReady) {
                 lastWriteFailureReason = "Notifications not ready"
+                refreshTransportTelemetry()
                 return false
             }
         }
@@ -1380,6 +1410,7 @@ class FlipperBleService : Service() {
                             val requiresAck = writeType == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                             val ack = if (requiresAck) CompletableDeferred<Boolean>() else null
                             pendingWriteAck = ack
+                            recordWriteAttempt(writeType)
 
                             characteristic.value = chunkData
                             characteristic.writeType = writeType
@@ -1389,6 +1420,7 @@ class FlipperBleService : Service() {
                                 pendingWriteAck = null
                                 lastWriteFailureReason = "Gatt rejected write " +
                                         "(type=$writeType, attempt=${attemptIndex + 1}, retry=$retryIndex)"
+                                refreshTransportTelemetry()
                                 if (retryIndex < writeAttempts) {
                                     delay(writeRetryDelayMs * retryIndex)
                                 }
@@ -1403,6 +1435,7 @@ class FlipperBleService : Service() {
                                 if (!confirmed) {
                                     lastWriteFailureReason = "Write ack timeout " +
                                             "(type=$writeType, attempt=${attemptIndex + 1}, retry=$retryIndex)"
+                                    refreshTransportTelemetry()
                                     if (retryIndex < writeAttempts) {
                                         delay(writeRetryDelayMs)
                                         continue
@@ -1427,14 +1460,17 @@ class FlipperBleService : Service() {
                         if (lastWriteFailureReason == null) {
                             lastWriteFailureReason = "Unknown write failure"
                         }
+                        refreshTransportTelemetry()
                         return@withContext false
                     }
                 }
                 lastWriteFailureReason = null
+                refreshTransportTelemetry()
                 true
             }
         } ?: run {
             pendingWriteAck = null
+            refreshTransportTelemetry()
             return false
         }
         return writeResult
@@ -1493,8 +1529,6 @@ class FlipperBleService : Service() {
             if (System.currentTimeMillis() >= deadline) {
                 return false
             }
-            // Try to refresh once while waiting in case notifications are stale.
-            refreshOverflowCapacity(overflowCharacteristic)
             delay(OVERFLOW_WAIT_POLL_MS)
         }
     }
@@ -1664,16 +1698,15 @@ class FlipperBleService : Service() {
         val supportsWrite = props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
         val supportsNoResponse = props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
         return when {
-            supportsWrite && supportsNoResponse && preferNoResponse -> listOf(
+            // Momentum Firmware serial RX exposes both WRITE and WRITE_WITHOUT_RESP.
+            // Always prefer WRITE_NO_RESPONSE when available: it completes immediately
+            // (no ATT Write Response wait), so the GATT op slot is freed faster and
+            // concurrent reads (keepalive, overflow) are far less likely to conflict.
+            supportsNoResponse -> listOf(
                 BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE,
                 BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
             )
-            supportsWrite && supportsNoResponse -> listOf(
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            )
             supportsWrite -> listOf(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-            supportsNoResponse -> listOf(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
             else -> listOf(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
         }
     }
@@ -1706,7 +1739,78 @@ class FlipperBleService : Service() {
         return serviceMatch && supportsNotifyOrIndicate(characteristic)
     }
 
+    private fun scheduleNotificationSetupTimeout(
+        gatt: BluetoothGatt,
+        device: FlipperDevice,
+        rxCharacteristic: BluetoothGattCharacteristic
+    ) {
+        notificationSetupTimeoutJob?.cancel()
+        notificationSetupTimeoutJob = serviceScope.launch {
+            delay(NOTIFICATION_SETUP_TIMEOUT_MS)
+            if (!isCurrentGatt(gatt)) return@launch
+            if (_connectionState.value !is ConnectionState.Connecting) return@launch
+            if (notificationsReady) return@launch
+
+            val props = describeCharacteristicProperties(rxCharacteristic)
+            val canStream = supportsNotifyOrIndicate(rxCharacteristic)
+            Log.w(
+                TAG,
+                "Notification descriptor callback timed out; " +
+                        "service=${serialServiceUuid} rx=${rxCharacteristic.uuid} props=$props " +
+                        "canStream=$canStream. Falling back to best-effort readiness."
+            )
+            logDiscoveredGattTopology(gatt)
+
+            if (canStream) {
+                notificationsReady = true
+                finalizeConnectedState(device)
+            } else {
+                pendingConnectedDevice = null
+                _connectionState.value = ConnectionState.Error(
+                    "Flipper RX characteristic does not support notify/indicate on this firmware."
+                )
+                updateNotification()
+            }
+        }
+    }
+
+    private fun logResolvedSerialTopology(
+        serialService: BluetoothGattService,
+        writeCharacteristic: BluetoothGattCharacteristic?,
+        notifyCharacteristic: BluetoothGattCharacteristic?
+    ) {
+        Log.i(
+            TAG,
+            "Resolved serial topology service=${serialService.uuid} " +
+                    "write=${writeCharacteristic?.uuid} writeProps=${writeCharacteristic?.let(::describeCharacteristicProperties)} " +
+                    "notify=${notifyCharacteristic?.uuid} notifyProps=${notifyCharacteristic?.let(::describeCharacteristicProperties)}"
+        )
+    }
+
+    private fun logDiscoveredGattTopology(gatt: BluetoothGatt) {
+        val summary = gatt.services.orEmpty().joinToString(separator = " | ", limit = 12) { service ->
+            val chars = service.characteristics.orEmpty().joinToString(separator = ",", limit = 8) { characteristic ->
+                "${characteristic.uuid}[${describeCharacteristicProperties(characteristic)}]"
+            }
+            "${service.uuid} -> $chars"
+        }
+        Log.i(TAG, "Discovered GATT topology: $summary")
+    }
+
+    private fun describeCharacteristicProperties(characteristic: BluetoothGattCharacteristic): String {
+        val props = mutableListOf<String>()
+        val value = characteristic.properties
+        if (value and BluetoothGattCharacteristic.PROPERTY_READ != 0) props += "read"
+        if (value and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) props += "write"
+        if (value and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) props += "write_no_resp"
+        if (value and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) props += "notify"
+        if (value and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) props += "indicate"
+        return if (props.isEmpty()) "none" else props.joinToString("+")
+    }
+
     private fun finalizeConnectedState(device: FlipperDevice) {
+        notificationSetupTimeoutJob?.cancel()
+        notificationSetupTimeoutJob = null
         pendingConnectionName = null
         pendingConnectedDevice = null
         activeTransport = CommandTransport.BLE
@@ -1721,37 +1825,29 @@ class FlipperBleService : Service() {
         updateNotification()
         startBleKeepalive()
 
-        // Enable overflow control but do NOT auto-probe the automation channel on connect.
-        // The CLI/RPC probe is expensive and should only run when the user explicitly
-        // requests diagnostics or when a command actually needs the automation channel.
+        // Register local notification listener for overflow so that any spontaneous NOTIFY
+        // from the Flipper is processed. We do NOT write the CCCD or read the characteristic:
+        // all Momentum Firmware BLE characteristics require ATTR_PERMISSION_AUTHEN_*, and any
+        // GATT read/write on the overflow char sets mDeviceBusy, which then blocks all RPC
+        // writes if the onCharacteristicRead/onDescriptorWrite callback is delayed during an
+        // auth challenge. Best-effort writes (remainingSerialBufferBytes == null) are fine
+        // for one-command-at-a-time RPC traffic.
         serviceScope.launch {
-            enableOverflowControl()
+            registerOverflowNotificationListener()
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun enableOverflowControl() {
+    private fun registerOverflowNotificationListener() {
         val gatt = bluetoothGatt ?: return
         val overflowCharacteristic = serialOverflowCharacteristic ?: return
         if (!hasBluetoothPermissions()) return
-
+        // Register locally so spontaneous NOTIFY packets from the Flipper are delivered
+        // to onCharacteristicChanged → updateOverflowCapacityFromBytes. We intentionally
+        // skip the CCCD writeDescriptor and readCharacteristic: those GATT ops require
+        // ATTR_PERMISSION_AUTHEN_READ and can leave mDeviceBusy stuck if the Flipper
+        // initiates an authentication challenge, which would block all RPC command writes.
         gatt.setCharacteristicNotification(overflowCharacteristic, true)
-        val descriptor = overflowCharacteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG)
-        if (descriptor != null && supportsNotifyOrIndicate(overflowCharacteristic)) {
-            descriptor.value = if (supportsNotification(overflowCharacteristic)) {
-                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            } else {
-                BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-            }
-            gatt.writeDescriptor(descriptor)
-        }
-        refreshOverflowCapacity(overflowCharacteristic)
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun refreshOverflowCapacity(overflowCharacteristic: BluetoothGattCharacteristic) {
-        if (!hasBluetoothPermissions()) return
-        bluetoothGatt?.readCharacteristic(overflowCharacteristic)
     }
 
     /**
@@ -1796,8 +1892,156 @@ class FlipperBleService : Service() {
         return flipperProtocol.probeCliAvailability(force)
     }
 
+    @SuppressLint("MissingPermission")
+    suspend fun tryAlternateBleSerialRoute(): Boolean {
+        if (activeTransport != CommandTransport.BLE) return false
+        if (!hasBluetoothPermissions()) return false
+        val gatt = bluetoothGatt ?: return false
+        val serviceUuid = serialServiceUuid ?: return false
+        val serialService = gatt.getService(serviceUuid) ?: return false
+
+        return withWriteMutexOrFail(
+            lockTimeoutMs = WRITE_MUTEX_STANDARD_WAIT_TIMEOUT_MS,
+            timeoutReason = "BLE write queue busy while switching serial route"
+        ) {
+            val candidates = serialService.characteristics.orEmpty()
+            val writeCandidates = candidates
+                .filter(::supportsWrite)
+                .distinctBy { it.uuid }
+            val notifyCandidates = candidates
+                .filter(::supportsNotifyOrIndicate)
+                .distinctBy { it.uuid }
+
+            if (writeCandidates.isEmpty() || notifyCandidates.isEmpty()) {
+                return@withWriteMutexOrFail false
+            }
+
+            val routePairs = buildList {
+                writeCandidates.forEach { writeCandidate ->
+                    notifyCandidates.forEach { notifyCandidate ->
+                        add(writeCandidate to notifyCandidate)
+                    }
+                }
+            }
+            if (routePairs.size <= 1) {
+                return@withWriteMutexOrFail false
+            }
+
+            val currentWriteUuid = serialCharacteristic?.uuid
+            val currentNotifyUuid = serialRxCharacteristic?.uuid
+            val currentIndex = routePairs.indexOfFirst { (writeCandidate, notifyCandidate) ->
+                writeCandidate.uuid == currentWriteUuid && notifyCandidate.uuid == currentNotifyUuid
+            }
+            val nextIndex = if (currentIndex >= 0) {
+                (currentIndex + 1) % routePairs.size
+            } else {
+                0
+            }
+            val (nextWriteCandidate, nextNotifyCandidate) =
+                routePairs.getOrNull(nextIndex) ?: return@withWriteMutexOrFail false
+            if (nextWriteCandidate.uuid == currentWriteUuid &&
+                nextNotifyCandidate.uuid == currentNotifyUuid
+            ) {
+                return@withWriteMutexOrFail false
+            }
+
+            serialCharacteristic = nextWriteCandidate
+            serialRxCharacteristic = nextNotifyCandidate
+            bleWriteRouteVerified = false
+            notificationsReady = true
+            lastWriteFailureReason = null
+            gatt.setCharacteristicNotification(nextNotifyCandidate, true)
+            val descriptor = nextNotifyCandidate.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG)
+            if (descriptor != null && supportsNotifyOrIndicate(nextNotifyCandidate)) {
+                descriptor.value = if (supportsNotification(nextNotifyCandidate)) {
+                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                } else {
+                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                }
+                gatt.writeDescriptor(descriptor)
+            }
+            Log.w(
+                TAG,
+                "Switching BLE serial route " +
+                        "write=${currentWriteUuid ?: "none"}->${nextWriteCandidate.uuid} " +
+                        "notify=${currentNotifyUuid ?: "none"}->${nextNotifyCandidate.uuid} " +
+                        "writeProps=${describeCharacteristicProperties(nextWriteCandidate)} " +
+                        "notifyProps=${describeCharacteristicProperties(nextNotifyCandidate)}"
+            )
+            refreshTransportTelemetry()
+            true
+        } ?: false
+    }
+
     fun isCommandTransportConnected(): Boolean {
         return isUsbCommandTransportConnected() || isBleCommandTransportConnected()
+    }
+
+    /** Returns true when the active command transport is Bluetooth LE (not USB). */
+    fun isBluetoothTransport(): Boolean = activeTransport == CommandTransport.BLE
+
+    fun isBleWriteRouteVerified(): Boolean = bleWriteRouteVerified
+
+    private fun recordWriteAttempt(writeType: Int) {
+        val label = when (writeType) {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT -> "default"
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE -> "no_response"
+            BluetoothGattCharacteristic.WRITE_TYPE_SIGNED -> "signed"
+            else -> "type=$writeType"
+        }
+        _transportTelemetry.value = _transportTelemetry.value.copy(
+            transportLabel = activeTransport.label(),
+            writeCharacteristicUuid = serialCharacteristic?.uuid?.toString(),
+            notifyCharacteristicUuid = serialRxCharacteristic?.uuid?.toString(),
+            lastWriteTypeLabel = label,
+            lastWriteFailure = lastWriteFailureReason,
+            writeRouteVerified = bleWriteRouteVerified,
+            lastUpdatedAtMs = System.currentTimeMillis()
+        )
+    }
+
+    private fun recordRxTelemetry(data: ByteArray) {
+        _transportTelemetry.value = _transportTelemetry.value.copy(
+            transportLabel = activeTransport.label(),
+            writeCharacteristicUuid = serialCharacteristic?.uuid?.toString(),
+            notifyCharacteristicUuid = serialRxCharacteristic?.uuid?.toString(),
+            lastWriteFailure = lastWriteFailureReason,
+            writeRouteVerified = bleWriteRouteVerified,
+            lastRxSummary = summarizeRxPayload(data),
+            lastUpdatedAtMs = System.currentTimeMillis()
+        )
+    }
+
+    private fun refreshTransportTelemetry() {
+        _transportTelemetry.value = _transportTelemetry.value.copy(
+            transportLabel = activeTransport.label(),
+            writeCharacteristicUuid = serialCharacteristic?.uuid?.toString(),
+            notifyCharacteristicUuid = serialRxCharacteristic?.uuid?.toString(),
+            lastWriteFailure = lastWriteFailureReason,
+            writeRouteVerified = bleWriteRouteVerified,
+            lastUpdatedAtMs = System.currentTimeMillis()
+        )
+    }
+
+    private fun summarizeRxPayload(data: ByteArray): String {
+        if (data.isEmpty()) return "0 bytes"
+        val ascii = data.toString(Charsets.UTF_8)
+            .replace("\u0000", "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .take(80)
+        val hexPrefix = data.take(8).joinToString(" ") { byte -> "%02x".format(byte) }
+        return if (ascii.isNotBlank()) {
+            "${data.size} bytes | hex=$hexPrefix | text=$ascii"
+        } else {
+            "${data.size} bytes | hex=$hexPrefix"
+        }
+    }
+
+    private fun CommandTransport.label(): String = when (this) {
+        CommandTransport.NONE -> "None"
+        CommandTransport.BLE -> "BLE"
+        CommandTransport.USB -> "USB"
     }
 
     private fun isBleCommandTransportConnected(): Boolean {
@@ -2458,6 +2702,7 @@ class FlipperBleService : Service() {
         private const val WRITE_MUTEX_CONTROL_WAIT_TIMEOUT_MS = 500L
         private const val NOTIFICATION_READY_WAIT_ATTEMPTS = 20
         private const val NOTIFICATION_READY_POLL_MS = 50L
+        private const val NOTIFICATION_SETUP_TIMEOUT_MS = 4_000L
         private const val COMMAND_TRANSPORT_READY_TIMEOUT_MS = 5_000L
         private const val COMMAND_TRANSPORT_READY_POLL_MS = 50L
         private const val BLE_KEEPALIVE_INTERVAL_MS = 3_000L
